@@ -14,7 +14,6 @@ import aiosqlite
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
-from mcp.types import TextContent
 import pandas as pd
 
 # Configure logging
@@ -54,7 +53,7 @@ async def health():
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
             count = (await cursor.fetchone())[0]
-        return {"status": "healthy", "version": "2.1.0", "glucose_readings_count": count}
+        return {"status": "healthy", "version": "2.2.0", "glucose_readings_count": count}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -156,7 +155,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
 # ============== MCP Tools ==============
 
 @mcp.tool()
-async def get_latest_glucose(hours: int = 24, limit: int = 100) -> list[TextContent]:
+async def get_latest_glucose(hours: int = 24, limit: int = 100) -> str:
     """
     Get the latest glucose readings.
     
@@ -165,7 +164,7 @@ async def get_latest_glucose(hours: int = 24, limit: int = 100) -> list[TextCont
         limit: Maximum number of readings to return (default 100)
     
     Returns:
-        List of glucose readings with timestamps
+        JSON string with glucose readings
     """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -183,18 +182,18 @@ async def get_latest_glucose(hours: int = 24, limit: int = 100) -> list[TextCont
             
             result = {
                 "count": len(readings),
-                "data": readings
+                "readings": readings
             }
             
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            return json.dumps(result, indent=2)
             
     except Exception as e:
         logger.error(f"Error fetching glucose: {e}")
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
-async def get_summary(days: int = 7) -> list[TextContent]:
+async def get_summary(days: int = 7) -> str:
     """
     Get a summary of glucose statistics over a period.
     
@@ -202,7 +201,7 @@ async def get_summary(days: int = 7) -> list[TextContent]:
         days: Number of days to summarize (default 7)
     
     Returns:
-        Summary statistics including average, min, max, time in range
+        JSON string with summary statistics including average, min, max, time in range
     """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -254,15 +253,15 @@ async def get_summary(days: int = 7) -> list[TextContent]:
                 "insulin_entries": insulin_count
             }
             
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            return json.dumps(result, indent=2)
             
     except Exception as e:
         logger.error(f"Error getting summary: {e}")
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
-async def get_glucose_by_date(date: str) -> list[TextContent]:
+async def get_glucose_by_date(date: str) -> str:
     """
     Get all glucose readings for a specific date.
     
@@ -270,7 +269,7 @@ async def get_glucose_by_date(date: str) -> list[TextContent]:
         date: Date in YYYY-MM-DD format
     
     Returns:
-        All readings for that date
+        JSON string with all readings for that date
     """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -300,15 +299,15 @@ async def get_glucose_by_date(date: str) -> list[TextContent]:
             else:
                 stats = {"date": date, "count": 0, "message": "No readings found for this date"}
             
-            return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+            return json.dumps(stats, indent=2)
             
     except Exception as e:
         logger.error(f"Error fetching by date: {e}")
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
-async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = "") -> list[TextContent]:
+async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = "") -> str:
     """
     Log an insulin dose.
     
@@ -318,7 +317,7 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
         notes: Optional notes about the dose
     
     Returns:
-        Confirmation of logged entry
+        JSON string with confirmation of logged entry
     """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -338,11 +337,11 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
                 "notes": notes
             }
             
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            return json.dumps(result, indent=2)
             
     except Exception as e:
         logger.error(f"Error logging insulin: {e}")
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        return json.dumps({"error": str(e)})
 
 
 # Mount MCP server
