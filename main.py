@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.2.0 - Fixed MCP response format
+Version: 2.2.0 - Fixed MCP response format and startup
 """
 
 import os
@@ -10,6 +10,7 @@ import hashlib
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
+from contextlib import asynccontextmanager
 import aiosqlite
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -23,25 +24,25 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-# Initialize FastAPI and MCP
-app = FastAPI(title="Stelo Glucose MCP", version="2.2.0")
-mcp = FastMCP("Stelo Glucose")
-
 logger.info(f"Starting Stelo MCP v2.2.0")
 logger.info(f"Database path: {DB_PATH}")
 
-# Import and run migrations
+# Import migrations
 from migrations import run_migrations
-import asyncio
 
-async def init_db():
-    """Initialize database with migrations."""
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize database on startup."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     await run_migrations(DB_PATH)
     logger.info("Database initialized and migrations complete")
+    yield
 
-# Run migrations on startup
-asyncio.get_event_loop().run_until_complete(init_db())
+
+# Initialize FastAPI and MCP
+app = FastAPI(title="Stelo Glucose MCP", version="2.2.0", lifespan=lifespan)
+mcp = FastMCP("Stelo Glucose")
 
 
 # ============== FastAPI Endpoints ==============
