@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.2.7 - Use SSE transport which works better with FastAPI mounting
+Version: 2.2.8 - Configure SSE app with allowed hosts for Railway
 """
 
 import os
@@ -22,14 +22,18 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.2.7")
+logger.info(f"Starting Stelo MCP v2.2.8")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# Initialize FastMCP
-mcp = FastMCP("Stelo Glucose")
+# Initialize FastMCP with host configuration
+mcp = FastMCP(
+    "Stelo Glucose",
+    host="0.0.0.0",
+    port=8085
+)
 
 # Flag to track if migrations have run
 _migrations_done = False
@@ -280,7 +284,7 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
         return json.dumps({"error": str(e)})
 
 
-# ============== FastAPI App with SSE MCP ==============
+# ============== FastAPI App ==============
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -291,7 +295,7 @@ async def lifespan(app: FastAPI):
 
 
 # Create FastAPI app
-app = FastAPI(title="Stelo Glucose MCP", version="2.2.7", lifespan=lifespan)
+app = FastAPI(title="Stelo Glucose MCP", version="2.2.8", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -302,7 +306,7 @@ async def health():
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
             count = (await cursor.fetchone())[0]
-        return {"status": "healthy", "version": "2.2.7", "glucose_readings_count": count}
+        return {"status": "healthy", "version": "2.2.8", "glucose_readings_count": count}
     except Exception as e:
         logger.error(f"Health check error: {e}")
         return {"status": "error", "message": str(e)}
@@ -443,7 +447,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
 
 
-# ============== Mount MCP using SSE transport ==============
-# The SSE transport is more compatible with being mounted as a sub-app
-sse_app = mcp.sse_app()
+# ============== Mount MCP using SSE transport with host validation disabled ==============
+# Pass host="0.0.0.0" to allow any host (needed for Railway's proxy)
+sse_app = mcp.sse_app(host="0.0.0.0")
 app.mount("/mcp", sse_app)
