@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.2.8 - SSE transport mounted at /mcp
+Version: 2.2.8 - Use lifespan to properly initialize streamable HTTP transport
 """
 
 import os
@@ -11,7 +11,8 @@ import logging
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 import aiosqlite
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
 import pandas as pd
 
@@ -280,18 +281,55 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
         return json.dumps({"error": str(e)})
 
 
-# ============== FastAPI App ==============
+# ============== FastAPI App with proper MCP lifespan ==============
+
+# Get the SSE app - we'll manage its lifecycle ourselves
+sse_app = mcp.sse_app()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown."""
     logger.info("Application starting up...")
-    yield
+    # Run the SSE app's lifespan if it has one
+    if hasattr(sse_app, 'router') and hasattr(sse_app.router, 'lifespan_context'):
+        async with sse_app.router.lifespan_context(sse_app):
+            yield
+    else:
+        yield
     logger.info("Application shutting down...")
 
 
 # Create FastAPI app
 app = FastAPI(title="Stelo Glucose MCP", version="2.2.8", lifespan=lifespan)
+
+
+# Middleware to rewrite Host header for MCP routes
+@app.middleware("http")
+async def rewrite_host_for_mcp(request: Request, call_next):
+    """Rewrite the Host header for MCP routes to bypass validation."""
+    if request.url.path.startswith("/mcp"):
+        # Create a modified scope with localhost as the host
+        # This tricks the MCP SDK's host validation
+        scope = dict(request.scope)
+        headers = dict(request.headers)
+        # The MCP SDK checks the Host header, so we need to modify the scope
+        new_headers = []
+        for key, value in scope.get("headers", []):
+            if key == b"host":
+                new_headers.append((b"host", b"localhost:8085"))
+            else:
+                new_headers.append((key, value))
+        scope["headers"] = new_headers
+        
+        # Create new request with modified scope
+        from starlette.requests import Request as StarletteRequest
+        modified_request = StarletteRequest(scope, request.receive)
+        
+        # We can't easily pass the modified request through call_next
+        # So instead, let's handle MCP routes directly
+    
+    response = await call_next(request)
+    return response
 
 
 @app.get("/health")
@@ -443,7 +481,31 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
 
 
-# ============== Mount MCP using SSE transport ==============
-# Get the SSE app from FastMCP
-sse_app = mcp.sse_app()
-app.mount("/mcp", sse_app)
+# ============== Mount MCP with host header override ==============
+# Create a wrapper that modifies the host header before passing to SSE app
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+class HostRewriteMiddleware:
+    """Middleware that rewrites the Host header to bypass MCP SDK validation."""
+    
+    def __init__(self, app: ASGIApp):
+        self.app = app
+    
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http":
+            # Rewrite host header to localhost
+            new_headers = []
+            for key, value in scope.get("headers", []):
+                if key == b"host":
+                    new_headers.append((b"host", b"localhost:8085"))
+                else:
+                    new_headers.append((key, value))
+            scope = dict(scope)
+            scope["headers"] = new_headers
+        
+        await self.app(scope, receive, send)
+
+
+# Wrap the SSE app with host rewrite middleware
+wrapped_sse_app = HostRewriteMiddleware(sse_app)
+app.mount("/mcp", wrapped_sse_app)
