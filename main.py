@@ -11,7 +11,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 import aiosqlite
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Response
 from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
 import pandas as pd
@@ -29,8 +29,8 @@ logger.info(f"Database path: {DB_PATH}")
 # Ensure data directory exists (sync - runs at import time)
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# Initialize FastAPI - NO redirect_slashes to avoid 307s
-app = FastAPI(title="Stelo Glucose MCP", version="2.2.3", redirect_slashes=False)
+# Initialize FastAPI - keep redirect_slashes default (True)
+app = FastAPI(title="Stelo Glucose MCP", version="2.2.3")
 mcp = FastMCP("Stelo Glucose")
 
 # Flag to track if migrations have run
@@ -497,6 +497,46 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
 
 
 # ============== MCP Server Mount ==============
-# Mount at /mcp - the streamable_http_app handles the MCP protocol
-# Note: Requests should go to /mcp/ (with trailing slash) for the sub-app
-app.mount("/mcp", mcp.streamable_http_app())
+# Get the streamable HTTP app from FastMCP
+mcp_app = mcp.streamable_http_app()
+
+# Mount at /mcp path
+# With default redirect_slashes=True, /mcp redirects to /mcp/
+# The mcp_app handles requests at its root
+app.mount("/mcp", mcp_app)
+
+# Add explicit handler for /mcp without trailing slash to avoid redirect
+@app.post("/mcp")
+@app.get("/mcp")
+async def handle_mcp_no_slash(request: Request):
+    """Handle /mcp requests without trailing slash by forwarding to MCP app."""
+    # Build the scope for the sub-app with path="/"
+    scope = dict(request.scope)
+    scope["path"] = "/"
+    scope["root_path"] = scope.get("root_path", "") + "/mcp"
+    
+    # Collect response parts
+    response_started = False
+    response_status = 200
+    response_headers = []
+    body_parts = []
+    
+    async def receive():
+        return await request.receive()
+    
+    async def send(message):
+        nonlocal response_started, response_status, response_headers
+        if message["type"] == "http.response.start":
+            response_started = True
+            response_status = message["status"]
+            response_headers = message.get("headers", [])
+        elif message["type"] == "http.response.body":
+            body_parts.append(message.get("body", b""))
+    
+    await mcp_app(scope, receive, send)
+    
+    # Build response
+    body = b"".join(body_parts)
+    headers_dict = {k.decode(): v.decode() for k, v in response_headers if k.lower() != b"content-length"}
+    
+    return Response(content=body, status_code=response_status, headers=headers_dict)
