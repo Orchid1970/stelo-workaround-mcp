@@ -2,15 +2,18 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+# Copy application
+COPY . .
 
-# Create data directory for SQLite
+# Create data directory
 RUN mkdir -p /data
-ENV DB_PATH=/data/glucose.db
 
-EXPOSE 8085
+# Expose port
+EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8085"]
+# Run the application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
