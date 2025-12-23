@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.2.2 - Fix MCP mount redirect issue
+Version: 2.2.3 - Fix MCP mount path
 """
 
 import os
@@ -23,14 +23,14 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.2.2")
+logger.info(f"Starting Stelo MCP v2.2.3")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists (sync - runs at import time)
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# Initialize FastAPI with redirect_slashes=False to prevent 307 redirects
-app = FastAPI(title="Stelo Glucose MCP", version="2.2.2", redirect_slashes=False)
+# Initialize FastAPI - NO redirect_slashes to avoid 307s
+app = FastAPI(title="Stelo Glucose MCP", version="2.2.3", redirect_slashes=False)
 mcp = FastMCP("Stelo Glucose")
 
 # Flag to track if migrations have run
@@ -57,7 +57,7 @@ async def health():
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
             count = (await cursor.fetchone())[0]
-        return {"status": "healthy", "version": "2.2.2", "glucose_readings_count": count}
+        return {"status": "healthy", "version": "2.2.3", "glucose_readings_count": count}
     except Exception as e:
         logger.error(f"Health check error: {e}")
         return {"status": "error", "message": str(e)}
@@ -496,26 +496,7 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
         return json.dumps({"error": str(e)})
 
 
-# Mount MCP server - use empty string path to avoid redirect issues
-# The mcp.streamable_http_app() will handle /mcp/* routes
-mcp_app = mcp.streamable_http_app()
-app.mount("/mcp", mcp_app)
-
-# Also add a direct POST handler for /mcp to catch requests without trailing slash
-@app.api_route("/mcp", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"])
-async def mcp_root_handler(request: Request):
-    """Handle requests to /mcp without trailing slash by forwarding to MCP app."""
-    # Get the MCP app's response
-    from starlette.routing import Mount
-    for route in app.routes:
-        if isinstance(route, Mount) and route.path == "/mcp":
-            # Forward the request with path set to "/"
-            scope = request.scope.copy()
-            scope["path"] = "/"
-            # Create a new request with modified scope
-            from starlette.requests import Request as StarletteRequest
-            new_request = StarletteRequest(scope, request.receive)
-            response = await route.app(scope, request.receive, request._send)
-            return response
-    
-    return JSONResponse({"error": "MCP app not found"}, status_code=500)
+# ============== MCP Server Mount ==============
+# Mount at /mcp - the streamable_http_app handles the MCP protocol
+# Note: Requests should go to /mcp/ (with trailing slash) for the sub-app
+app.mount("/mcp", mcp.streamable_http_app())
