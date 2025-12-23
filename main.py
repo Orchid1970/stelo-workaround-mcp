@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.2.0 - Fixed MCP response format and startup
+Version: 2.2.1 - Fixed startup with lazy db init
 """
 
 import os
@@ -23,25 +23,26 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.2.0")
+logger.info(f"Starting Stelo MCP v2.2.1")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists (sync - runs at import time)
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# Initialize FastAPI and MCP
-app = FastAPI(title="Stelo Glucose MCP", version="2.2.0")
+# Initialize FastAPI and MCP - NO LIFESPAN
+app = FastAPI(title="Stelo Glucose MCP", version="2.2.1")
 mcp = FastMCP("Stelo Glucose")
 
 # Flag to track if migrations have run
 _migrations_done = False
 
 async def ensure_db_ready():
-    """Ensure database is initialized. Called on first request."""
+    """Ensure database is initialized. Called lazily on first request."""
     global _migrations_done
     if not _migrations_done:
         from migrations import run_migrations
-        await run_migrations(DB_PATH)
+        # run_migrations is sync, not async - just call it directly
+        run_migrations(DB_PATH)
         logger.info("Database initialized and migrations complete")
         _migrations_done = True
 
@@ -56,7 +57,7 @@ async def health():
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
             count = (await cursor.fetchone())[0]
-        return {"status": "healthy", "version": "2.2.0", "glucose_readings_count": count}
+        return {"status": "healthy", "version": "2.2.1", "glucose_readings_count": count}
     except Exception as e:
         logger.error(f"Health check error: {e}")
         return {"status": "error", "message": str(e)}
