@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.2.6 - Use FastMCP as main app with custom routes added
+Version: 2.2.7 - Use SSE transport which works better with FastAPI mounting
 """
 
 import os
@@ -9,10 +9,9 @@ import json
 import hashlib
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from contextlib import asynccontextmanager
 import aiosqlite
-from fastapi import HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from mcp.server.fastmcp import FastMCP
 import pandas as pd
 
@@ -23,13 +22,13 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.2.6")
+logger.info(f"Starting Stelo MCP v2.2.7")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# Initialize FastMCP as the MAIN app
+# Initialize FastMCP
 mcp = FastMCP("Stelo Glucose")
 
 # Flag to track if migrations have run
@@ -281,14 +280,21 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
         return json.dumps({"error": str(e)})
 
 
-# ============== Custom HTTP Routes (added to FastMCP's internal FastAPI app) ==============
+# ============== FastAPI App with SSE MCP ==============
 
-# Get the underlying FastAPI app from FastMCP
-app = mcp._mcp_server.app if hasattr(mcp, '_mcp_server') and hasattr(mcp._mcp_server, 'app') else None
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown."""
+    logger.info("Application starting up...")
+    yield
+    logger.info("Application shutting down...")
 
-# If we can't access the internal app, we need a different approach
-# FastMCP exposes custom_route decorator for adding routes
-@mcp.custom_route("/health", methods=["GET"])
+
+# Create FastAPI app
+app = FastAPI(title="Stelo Glucose MCP", version="2.2.7", lifespan=lifespan)
+
+
+@app.get("/health")
 async def health():
     """Health check endpoint."""
     try:
@@ -296,13 +302,13 @@ async def health():
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
             count = (await cursor.fetchone())[0]
-        return {"status": "healthy", "version": "2.2.6", "glucose_readings_count": count}
+        return {"status": "healthy", "version": "2.2.7", "glucose_readings_count": count}
     except Exception as e:
         logger.error(f"Health check error: {e}")
         return {"status": "error", "message": str(e)}
 
 
-@mcp.custom_route("/upload/clarity", methods=["POST"])
+@app.post("/upload/clarity")
 async def upload_clarity_csv(file: UploadFile = File(...)):
     """Upload a Dexcom Clarity CSV export."""
     await ensure_db_ready()
@@ -437,11 +443,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
 
 
-# For running with uvicorn, we need to expose the ASGI app
-# FastMCP's run() method handles this, but for uvicorn we use http_app()
-def create_app():
-    """Create the ASGI app for uvicorn."""
-    return mcp.http_app()
-
-# This is what uvicorn will use
-app = create_app()
+# ============== Mount MCP using SSE transport ==============
+# The SSE transport is more compatible with being mounted as a sub-app
+sse_app = mcp.sse_app()
+app.mount("/mcp", sse_app)
