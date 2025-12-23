@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.2.8 - Configure SSE app with allowed hosts for Railway
+Version: 2.2.8 - SSE transport mounted at /mcp
 """
 
 import os
@@ -28,12 +28,8 @@ logger.info(f"Database path: {DB_PATH}")
 # Ensure data directory exists
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# Initialize FastMCP with host configuration
-mcp = FastMCP(
-    "Stelo Glucose",
-    host="0.0.0.0",
-    port=8085
-)
+# Initialize FastMCP
+mcp = FastMCP("Stelo Glucose")
 
 # Flag to track if migrations have run
 _migrations_done = False
@@ -447,7 +443,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
 
 
-# ============== Mount MCP using SSE transport with host validation disabled ==============
-# Pass host="0.0.0.0" to allow any host (needed for Railway's proxy)
-sse_app = mcp.sse_app(host="0.0.0.0")
+# ============== Mount MCP using SSE transport ==============
+# Get the SSE app from FastMCP
+sse_app = mcp.sse_app()
 app.mount("/mcp", sse_app)
