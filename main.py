@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.2.4 - Diagnostic version to debug MCP mounting
+Version: 2.2.5 - Fixed MCP mount path (mount at root, not /mcp)
 """
 
 import os
@@ -17,20 +17,20 @@ from mcp.server.fastmcp import FastMCP
 import pandas as pd
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.2.4 (diagnostic)")
+logger.info(f"Starting Stelo MCP v2.2.5")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists (sync - runs at import time)
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # Initialize FastAPI
-app = FastAPI(title="Stelo Glucose MCP", version="2.2.4")
+app = FastAPI(title="Stelo Glucose MCP", version="2.2.5")
 mcp = FastMCP("Stelo Glucose")
 
 # Flag to track if migrations have run
@@ -46,7 +46,7 @@ async def ensure_db_ready():
         _migrations_done = True
 
 
-# ============== MCP Tools (define BEFORE getting the app) ==============
+# ============== MCP Tools ==============
 
 @mcp.tool()
 async def get_latest_glucose(hours: int = 24, limit: int = 50) -> str:
@@ -282,23 +282,6 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
         return json.dumps({"error": str(e)})
 
 
-# ============== Get MCP App and inspect it ==============
-logger.info("Creating MCP streamable HTTP app...")
-mcp_app = mcp.streamable_http_app()
-logger.info(f"MCP app type: {type(mcp_app)}")
-logger.info(f"MCP app: {mcp_app}")
-
-# Try to inspect routes if it's a Starlette app
-if hasattr(mcp_app, 'routes'):
-    logger.info(f"MCP app routes: {mcp_app.routes}")
-    for route in mcp_app.routes:
-        logger.info(f"  Route: {route}")
-        if hasattr(route, 'path'):
-            logger.info(f"    Path: {route.path}")
-        if hasattr(route, 'methods'):
-            logger.info(f"    Methods: {route.methods}")
-
-
 # ============== FastAPI Endpoints ==============
 
 @app.get("/health")
@@ -309,32 +292,10 @@ async def health():
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
             count = (await cursor.fetchone())[0]
-        return {"status": "healthy", "version": "2.2.4", "glucose_readings_count": count}
+        return {"status": "healthy", "version": "2.2.5", "glucose_readings_count": count}
     except Exception as e:
         logger.error(f"Health check error: {e}")
         return {"status": "error", "message": str(e)}
-
-
-@app.get("/debug/mcp-info")
-async def debug_mcp_info():
-    """Debug endpoint to show MCP app info."""
-    info = {
-        "mcp_app_type": str(type(mcp_app)),
-        "mcp_app_str": str(mcp_app)[:500],
-        "has_routes": hasattr(mcp_app, 'routes'),
-        "routes": []
-    }
-    if hasattr(mcp_app, 'routes'):
-        for route in mcp_app.routes:
-            route_info = {"type": str(type(route))}
-            if hasattr(route, 'path'):
-                route_info["path"] = route.path
-            if hasattr(route, 'methods'):
-                route_info["methods"] = list(route.methods) if route.methods else None
-            if hasattr(route, 'name'):
-                route_info["name"] = route.name
-            info["routes"].append(route_info)
-    return info
 
 
 @app.post("/upload/clarity")
@@ -472,12 +433,8 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
 
 
-# ============== Mount MCP App ==============
-logger.info("Mounting MCP app at /mcp...")
-app.mount("/mcp", mcp_app)
-logger.info("MCP app mounted.")
-
-# Log all routes on the main app
-logger.info("Main app routes:")
-for route in app.routes:
-    logger.info(f"  {route}")
+# ============== Mount MCP App at ROOT ==============
+# The MCP streamable_http_app() creates its own route at /mcp internally
+# So we mount it at "" (root) so /mcp is accessible directly
+mcp_app = mcp.streamable_http_app()
+app.mount("", mcp_app)
