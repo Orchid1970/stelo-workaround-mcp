@@ -10,7 +10,6 @@ import hashlib
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
-from contextlib import asynccontextmanager
 import aiosqlite
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -27,22 +26,24 @@ DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 logger.info(f"Starting Stelo MCP v2.2.0")
 logger.info(f"Database path: {DB_PATH}")
 
-# Import migrations
-from migrations import run_migrations
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize database on startup."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    await run_migrations(DB_PATH)
-    logger.info("Database initialized and migrations complete")
-    yield
-
+# Ensure data directory exists (sync - runs at import time)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # Initialize FastAPI and MCP
-app = FastAPI(title="Stelo Glucose MCP", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="Stelo Glucose MCP", version="2.2.0")
 mcp = FastMCP("Stelo Glucose")
+
+# Flag to track if migrations have run
+_migrations_done = False
+
+async def ensure_db_ready():
+    """Ensure database is initialized. Called on first request."""
+    global _migrations_done
+    if not _migrations_done:
+        from migrations import run_migrations
+        await run_migrations(DB_PATH)
+        logger.info("Database initialized and migrations complete")
+        _migrations_done = True
 
 
 # ============== FastAPI Endpoints ==============
@@ -51,17 +52,21 @@ mcp = FastMCP("Stelo Glucose")
 async def health():
     """Health check endpoint."""
     try:
+        await ensure_db_ready()
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
             count = (await cursor.fetchone())[0]
         return {"status": "healthy", "version": "2.2.0", "glucose_readings_count": count}
     except Exception as e:
+        logger.error(f"Health check error: {e}")
         return {"status": "error", "message": str(e)}
 
 
 @app.post("/upload/clarity")
 async def upload_clarity_csv(file: UploadFile = File(...)):
     """Upload a Dexcom Clarity CSV export."""
+    await ensure_db_ready()
+    
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
     
@@ -168,6 +173,7 @@ async def get_latest_glucose(hours: int = 24, limit: int = 100) -> str:
         JSON string with glucose readings
     """
     try:
+        await ensure_db_ready()
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
@@ -205,6 +211,7 @@ async def get_summary(days: int = 7) -> str:
         JSON string with summary statistics including average, min, max, time in range
     """
     try:
+        await ensure_db_ready()
         async with aiosqlite.connect(DB_PATH) as db:
             # Get basic stats
             cursor = await db.execute(
@@ -273,6 +280,7 @@ async def get_glucose_by_date(date: str) -> str:
         JSON string with all readings for that date
     """
     try:
+        await ensure_db_ready()
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
@@ -321,6 +329,7 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
         JSON string with confirmation of logged entry
     """
     try:
+        await ensure_db_ready()
         async with aiosqlite.connect(DB_PATH) as db:
             timestamp = datetime.now().isoformat()
             await db.execute(
