@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.3.2 - Use correct table/column names matching existing database
+Version: 2.4.0 - Multi-sensor support with transmitter_id tracking
 """
 
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.3.2")
+logger.info(f"Starting Stelo MCP v2.4.0")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists
@@ -145,14 +145,21 @@ async def get_latest_glucose(hours: int = 24, limit: int = 50) -> str:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl 
+                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl, transmitter_id
                    FROM glucose_readings 
                    ORDER BY timestamp DESC 
                    LIMIT ?""",
                 (limit,)
             )
             rows = await cursor.fetchall()
-            readings = [{"timestamp": row["timestamp"], "glucose_mg_dl": row["glucose_mg_dl"]} for row in rows]
+            readings = [
+                {
+                    "timestamp": row["timestamp"], 
+                    "glucose_mg_dl": row["glucose_mg_dl"],
+                    "transmitter_id": row["transmitter_id"] if "transmitter_id" in row.keys() else None
+                } 
+                for row in rows
+            ]
             return json.dumps({"readings": readings, "count": len(readings)}, indent=2)
     except Exception as e:
         logger.error(f"Error fetching glucose: {e}")
@@ -354,7 +361,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Stelo Glucose MCP",
     description="Timothy's Dexcom Stelo glucose data integration for Simtheory.ai",
-    version="2.3.2",
+    version="2.4.0",
     lifespan=lifespan
 )
 
@@ -377,7 +384,7 @@ async def handle_mcp_jsonrpc(body: dict) -> dict:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.3.2"}
+                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.4.0"}
             }
         }
     
@@ -451,7 +458,7 @@ async def root():
     """Root endpoint - service info."""
     return {
         "service": "stelo-glucose-mcp",
-        "version": "2.3.2",
+        "version": "2.4.0",
         "protocol": "MCP JSON-RPC",
         "description": "Timothy's Dexcom Stelo glucose data integration for Simtheory.ai",
         "available_tools": [tool["name"] for tool in MCP_TOOLS],
@@ -508,7 +515,7 @@ async def health():
             count = (await cursor.fetchone())[0]
         return {
             "status": "healthy",
-            "version": "2.3.2",
+            "version": "2.4.0",
             "database": DB_PATH,
             "glucose_readings": count,
             "glucose_column": glucose_col
@@ -573,6 +580,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
         insulin_col = None
         carbs_col = None
         event_subtype_col = None
+        transmitter_col = None
         
         for col in df.columns:
             col_lower = col.lower()
@@ -586,6 +594,8 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
                 insulin_col = col
             if 'carb' in col_lower and 'value' in col_lower:
                 carbs_col = col
+            if 'transmitter' in col_lower and 'id' in col_lower:
+                transmitter_col = col
         
         if not ts_col:
             raise HTTPException(status_code=400, detail="Could not find timestamp column")
@@ -601,21 +611,31 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
                 if timestamp == 'nan' or not timestamp:
                     continue
                 
-                # Insert glucose readings
+                # Extract transmitter_id if available
+                transmitter_id = None
+                if transmitter_col and pd.notna(row.get(transmitter_col)):
+                    transmitter_id = str(row[transmitter_col]).strip()
+                
+                # Insert glucose readings with transmitter_id
                 if csv_glucose_col and pd.notna(row.get(csv_glucose_col)):
                     glucose_val = row[csv_glucose_col]
                     if isinstance(glucose_val, (int, float)) and glucose_val > 0:
-                        reading_hash = hashlib.sha256(f"{timestamp}:{glucose_val}:{file_hash}".encode()).hexdigest()[:16]
+                        reading_hash = hashlib.sha256(f"{timestamp}:{glucose_val}:{transmitter_id}:{file_hash}".encode()).hexdigest()[:16]
+                        
+                        # Check duplicate with transmitter_id included
                         cursor = await db.execute(
-                            f"SELECT 1 FROM glucose_readings WHERE timestamp = ? AND {glucose_col} = ?",
-                            (timestamp, int(glucose_val))
+                            f"""SELECT 1 FROM glucose_readings 
+                               WHERE timestamp = ? AND {glucose_col} = ? AND 
+                               (transmitter_id = ? OR (transmitter_id IS NULL AND ? IS NULL))""",
+                            (timestamp, int(glucose_val), transmitter_id, transmitter_id)
                         )
                         exists = await cursor.fetchone()
+                        
                         if not exists:
                             await db.execute(
-                                f"""INSERT INTO glucose_readings (timestamp, {glucose_col}, data_hash)
-                                   VALUES (?, ?, ?)""",
-                                (timestamp, int(glucose_val), reading_hash)
+                                f"""INSERT INTO glucose_readings (timestamp, {glucose_col}, transmitter_id, data_hash)
+                                   VALUES (?, ?, ?, ?)""",
+                                (timestamp, int(glucose_val), transmitter_id, reading_hash)
                             )
                             inserted_glucose += 1
                         else:

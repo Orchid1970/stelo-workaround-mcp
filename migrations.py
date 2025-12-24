@@ -14,11 +14,10 @@ MIGRATIONS = [
     },
     {
         "version": 2,
-        "description": "Add transmitter_id to support multiple sensors (Stelo sensors change every 14-15 days)",
+        "description": "Add transmitter_id to support multiple sensors",
         "sql": [
             "ALTER TABLE glucose_readings ADD COLUMN transmitter_id TEXT;",
-            "CREATE INDEX IF NOT EXISTS idx_transmitter ON glucose_readings(transmitter_id);",
-            "CREATE INDEX IF NOT EXISTS idx_timestamp_transmitter ON glucose_readings(timestamp, transmitter_id);"
+            "CREATE INDEX IF NOT EXISTS idx_transmitter ON glucose_readings(transmitter_id);"
         ]
     }
 ]
