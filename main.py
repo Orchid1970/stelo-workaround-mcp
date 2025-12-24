@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.3.0 - Add HTTP POST JSON-RPC handler for Simtheory.ai compatibility
+Version: 2.3.1 - Add schema debug endpoint to diagnose column name mismatch
 """
 
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.3.0")
+logger.info(f"Starting Stelo MCP v2.3.1")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists
@@ -319,7 +319,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Stelo Glucose MCP",
     description="Timothy's Dexcom Stelo glucose data integration for Simtheory.ai",
-    version="2.3.0",
+    version="2.3.1",
     lifespan=lifespan
 )
 
@@ -342,7 +342,7 @@ async def handle_mcp_jsonrpc(body: dict) -> dict:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.3.0"}
+                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.3.1"}
             }
         }
     
@@ -416,7 +416,7 @@ async def root():
     """Root endpoint - service info."""
     return {
         "service": "stelo-glucose-mcp",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "protocol": "MCP JSON-RPC",
         "description": "Timothy's Dexcom Stelo glucose data integration for Simtheory.ai",
         "available_tools": [tool["name"] for tool in MCP_TOOLS],
@@ -424,7 +424,8 @@ async def root():
             "mcp_protocol": "POST /",
             "mcp_alt": "POST /mcp",
             "health": "GET /health",
-            "upload": "POST /upload/clarity"
+            "upload": "POST /upload/clarity",
+            "debug_schema": "GET /debug/schema"
         }
     }
 
@@ -471,12 +472,52 @@ async def health():
             count = (await cursor.fetchone())[0]
         return {
             "status": "healthy",
-            "version": "2.3.0",
+            "version": "2.3.1",
             "database": DB_PATH,
             "glucose_readings": count
         }
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
+
+
+@app.get("/debug/schema")
+async def debug_schema():
+    """Debug endpoint to check actual database schema."""
+    try:
+        await ensure_db_ready()
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get all tables
+            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row[0] for row in await cursor.fetchall()]
+            
+            schema_info = {"tables": {}}
+            
+            for table in tables:
+                cursor = await db.execute(f"PRAGMA table_info({table})")
+                columns = await cursor.fetchall()
+                schema_info["tables"][table] = {
+                    "columns": [
+                        {"name": col[1], "type": col[2], "notnull": col[3], "pk": col[5]}
+                        for col in columns
+                    ]
+                }
+                
+                # Get row count
+                cursor = await db.execute(f"SELECT COUNT(*) FROM {table}")
+                count = (await cursor.fetchone())[0]
+                schema_info["tables"][table]["row_count"] = count
+                
+                # Get sample row if exists
+                if count > 0:
+                    cursor = await db.execute(f"SELECT * FROM {table} LIMIT 1")
+                    sample = await cursor.fetchone()
+                    col_names = [col[1] for col in columns]
+                    schema_info["tables"][table]["sample_row"] = dict(zip(col_names, sample))
+            
+            return schema_info
+    except Exception as e:
+        logger.error(f"Error getting schema: {e}")
+        return {"error": str(e)}
 
 
 @app.post("/upload/clarity")
