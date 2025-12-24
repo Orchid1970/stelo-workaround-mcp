@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.3.1 - Auto-detect glucose column name for backward compatibility
+Version: 2.3.2 - Use correct table/column names matching existing database
 """
 
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.3.1")
+logger.info(f"Starting Stelo MCP v2.3.2")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists
@@ -59,15 +59,15 @@ async def get_glucose_column() -> str:
         logger.info(f"Detected columns in glucose_readings: {columns}")
         
         # Check for known column names in order of preference
-        if 'glucose_mg_dl' in columns:
+        if 'glucose_value' in columns:
+            _glucose_column = 'glucose_value'
+        elif 'glucose_mg_dl' in columns:
             _glucose_column = 'glucose_mg_dl'
         elif 'value' in columns:
             _glucose_column = 'value'
-        elif 'glucose_value' in columns:
-            _glucose_column = 'glucose_value'
         else:
             # Default, might fail but let's try
-            _glucose_column = 'glucose_mg_dl'
+            _glucose_column = 'glucose_value'
         
         logger.info(f"Using glucose column: {_glucose_column}")
         return _glucose_column
@@ -126,8 +126,8 @@ MCP_TOOLS = [
             "properties": {
                 "units": {"type": "number", "description": "Number of insulin units"},
                 "insulin_type": {"type": "string", "default": "rapid", "description": "Type of insulin (rapid, long, etc.)"},
-                "notes": {"type": "string", "default": "", "description": "Optional notes"}}
-            ,
+                "notes": {"type": "string", "default": "", "description": "Optional notes"}
+            },
             "required": ["units"]
         }
     }
@@ -228,17 +228,17 @@ async def get_summary(days: int = 14) -> str:
             )
             glucose_rows = await cursor.fetchall()
             
-            # Get insulin entries
+            # Get insulin entries (table is 'insulin', not 'insulin_entries')
             cursor = await db.execute(
-                """SELECT timestamp, units, insulin_type FROM insulin_entries 
+                """SELECT timestamp, units, insulin_type FROM insulin 
                    WHERE timestamp >= ? ORDER BY timestamp""",
                 (cutoff,)
             )
             insulin_rows = await cursor.fetchall()
             
-            # Get carb entries
+            # Get carb entries (table is 'carbs', column is 'carbs_grams')
             cursor = await db.execute(
-                """SELECT timestamp, grams FROM carb_entries 
+                """SELECT timestamp, carbs_grams FROM carbs 
                    WHERE timestamp >= ? ORDER BY timestamp""",
                 (cutoff,)
             )
@@ -267,7 +267,7 @@ async def get_summary(days: int = 14) -> str:
                     for row in insulin_rows[-5:]
                 ],
                 "recent_carbs": [
-                    {"timestamp": row["timestamp"], "grams": row["grams"]}
+                    {"timestamp": row["timestamp"], "grams": row["carbs_grams"]}
                     for row in carb_rows[-5:]
                 ]
             }
@@ -316,12 +316,14 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
     try:
         await ensure_db_ready()
         timestamp = datetime.now().isoformat()
+        data_hash = hashlib.sha256(f"{timestamp}:{units}:{insulin_type}".encode()).hexdigest()[:16]
         
         async with aiosqlite.connect(DB_PATH) as db:
+            # Use 'insulin' table with correct columns
             await db.execute(
-                """INSERT INTO insulin_entries (timestamp, units, insulin_type, notes)
+                """INSERT INTO insulin (timestamp, units, insulin_type, data_hash)
                    VALUES (?, ?, ?, ?)""",
-                (timestamp, units, insulin_type, notes)
+                (timestamp, units, insulin_type, data_hash)
             )
             await db.commit()
         
@@ -352,7 +354,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Stelo Glucose MCP",
     description="Timothy's Dexcom Stelo glucose data integration for Simtheory.ai",
-    version="2.3.1",
+    version="2.3.2",
     lifespan=lifespan
 )
 
@@ -375,7 +377,7 @@ async def handle_mcp_jsonrpc(body: dict) -> dict:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.3.1"}
+                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.3.2"}
             }
         }
     
@@ -449,7 +451,7 @@ async def root():
     """Root endpoint - service info."""
     return {
         "service": "stelo-glucose-mcp",
-        "version": "2.3.1",
+        "version": "2.3.2",
         "protocol": "MCP JSON-RPC",
         "description": "Timothy's Dexcom Stelo glucose data integration for Simtheory.ai",
         "available_tools": [tool["name"] for tool in MCP_TOOLS],
@@ -506,7 +508,7 @@ async def health():
             count = (await cursor.fetchone())[0]
         return {
             "status": "healthy",
-            "version": "2.3.1",
+            "version": "2.3.2",
             "database": DB_PATH,
             "glucose_readings": count,
             "glucose_column": glucose_col
@@ -599,6 +601,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
                 if timestamp == 'nan' or not timestamp:
                     continue
                 
+                # Insert glucose readings
                 if csv_glucose_col and pd.notna(row.get(csv_glucose_col)):
                     glucose_val = row[csv_glucose_col]
                     if isinstance(glucose_val, (int, float)) and glucose_val > 0:
@@ -618,11 +621,12 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
                         else:
                             skipped_duplicates += 1
                 
+                # Insert insulin entries (using 'insulin' table)
                 if insulin_col and pd.notna(row.get(insulin_col)):
                     insulin_val = row[insulin_col]
                     if isinstance(insulin_val, (int, float)) and insulin_val > 0:
                         cursor = await db.execute(
-                            "SELECT 1 FROM insulin_entries WHERE timestamp = ? AND units = ?",
+                            "SELECT 1 FROM insulin WHERE timestamp = ? AND units = ?",
                             (timestamp, float(insulin_val))
                         )
                         exists = await cursor.fetchone()
@@ -632,26 +636,29 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
                                 subtype = str(row[event_subtype_col]).lower()
                                 if 'long' in subtype:
                                     insulin_type = "long"
+                            ins_hash = hashlib.sha256(f"{timestamp}:{insulin_val}:{file_hash}".encode()).hexdigest()[:16]
                             await db.execute(
-                                """INSERT INTO insulin_entries (timestamp, units, insulin_type, notes)
+                                """INSERT INTO insulin (timestamp, units, insulin_type, data_hash)
                                    VALUES (?, ?, ?, ?)""",
-                                (timestamp, float(insulin_val), insulin_type, "From Clarity CSV")
+                                (timestamp, float(insulin_val), insulin_type, ins_hash)
                             )
                             inserted_insulin += 1
                 
+                # Insert carb entries (using 'carbs' table with 'carbs_grams' column)
                 if carbs_col and pd.notna(row.get(carbs_col)):
                     carbs_val = row[carbs_col]
                     if isinstance(carbs_val, (int, float)) and carbs_val > 0:
                         cursor = await db.execute(
-                            "SELECT 1 FROM carb_entries WHERE timestamp = ? AND grams = ?",
+                            "SELECT 1 FROM carbs WHERE timestamp = ? AND carbs_grams = ?",
                             (timestamp, int(carbs_val))
                         )
                         exists = await cursor.fetchone()
                         if not exists:
+                            carb_hash = hashlib.sha256(f"{timestamp}:{carbs_val}:{file_hash}".encode()).hexdigest()[:16]
                             await db.execute(
-                                """INSERT INTO carb_entries (timestamp, grams, notes)
+                                """INSERT INTO carbs (timestamp, carbs_grams, data_hash)
                                    VALUES (?, ?, ?)""",
-                                (timestamp, int(carbs_val), "From Clarity CSV")
+                                (timestamp, int(carbs_val), carb_hash)
                             )
                             inserted_carbs += 1
             
