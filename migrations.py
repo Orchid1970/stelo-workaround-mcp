@@ -27,6 +27,28 @@ MIGRATIONS = [
         "sql": [
             "UPDATE glucose_readings SET transmitter_id = REPLACE(transmitter_id, '.0', '') WHERE transmitter_id LIKE '%.0';"
         ]
+    },
+    {
+        "version": 4,
+        "description": "Remove UNIQUE constraint on (timestamp, transmitter_id) - SQLite requires table rebuild",
+        "sql": [
+            # SQLite doesn't support DROP CONSTRAINT, need to rebuild table
+            """CREATE TABLE glucose_readings_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                glucose_value INTEGER NOT NULL,
+                rate_of_change REAL,
+                transmitter_id TEXT,
+                data_hash TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )""",
+            "INSERT INTO glucose_readings_new SELECT id, timestamp, glucose_value, rate_of_change, transmitter_id, data_hash, created_at FROM glucose_readings",
+            "DROP TABLE glucose_readings",
+            "ALTER TABLE glucose_readings_new RENAME TO glucose_readings",
+            "CREATE INDEX IF NOT EXISTS idx_timestamp ON glucose_readings(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_transmitter ON glucose_readings(transmitter_id)",
+            "CREATE INDEX IF NOT EXISTS idx_timestamp_transmitter ON glucose_readings(timestamp, transmitter_id)"
+        ]
     }
 ]
 
@@ -66,7 +88,7 @@ def run_migrations(db_path: str):
                 for sql in migration["sql"]:
                     try:
                         conn.execute(sql)
-                        logger.info(f"  Executed: {sql[:50]}...")
+                        logger.info(f"  Executed: {sql[:80]}...")
                     except sqlite3.OperationalError as e:
                         # Column might already exist
                         if "duplicate column" in str(e).lower():
