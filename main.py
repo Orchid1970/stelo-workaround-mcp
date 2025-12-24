@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.4.1 - Fix transmitter_id float conversion
+Version: 2.4.2 - Add debug endpoint
 """
 
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.4.1")
+logger.info(f"Starting Stelo MCP v2.4.2")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists
@@ -378,7 +378,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Stelo Glucose MCP",
     description="Timothy's Dexcom Stelo glucose data integration for Simtheory.ai - Multi-sensor support",
-    version="2.4.1",
+    version="2.4.2",
     lifespan=lifespan
 )
 
@@ -401,7 +401,7 @@ async def handle_mcp_jsonrpc(body: dict) -> dict:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.4.1"}
+                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.4.2"}
             }
         }
     
@@ -475,7 +475,7 @@ async def root():
     """Root endpoint - service info."""
     return {
         "service": "stelo-glucose-mcp",
-        "version": "2.4.1",
+        "version": "2.4.2",
         "protocol": "MCP JSON-RPC",
         "description": "Timothy's Dexcom Stelo glucose data integration - Multi-sensor support (sensors change every 14-15 days)",
         "available_tools": [tool["name"] for tool in MCP_TOOLS],
@@ -484,7 +484,8 @@ async def root():
             "mcp_alt": "POST /mcp",
             "health": "GET /health",
             "upload": "POST /upload/clarity",
-            "schema": "GET /debug/schema"
+            "schema": "GET /debug/schema",
+            "debug_reading": "GET /debug/reading?timestamp=YYYY-MM-DDThh:mm:ss"
         }
     }
 
@@ -537,7 +538,7 @@ async def health():
             
         return {
             "status": "healthy",
-            "version": "2.4.1",
+            "version": "2.4.2",
             "database": DB_PATH,
             "glucose_readings": count,
             "unique_sensors": sensor_count,
@@ -568,6 +569,38 @@ async def debug_schema():
                 "tables": tables,
                 "schema": schema
             }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/debug/reading")
+async def debug_reading(timestamp: str):
+    """Debug endpoint to check if a specific reading exists."""
+    try:
+        await ensure_db_ready()
+        glucose_col = await get_glucose_column()
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl, transmitter_id, data_hash 
+                   FROM glucose_readings 
+                   WHERE timestamp = ?""",
+                (timestamp,)
+            )
+            row = await cursor.fetchone()
+            
+            if row:
+                return {
+                    "exists": True,
+                    "reading": {
+                        "timestamp": row["timestamp"],
+                        "glucose_mg_dl": row["glucose_mg_dl"],
+                        "transmitter_id": row["transmitter_id"],
+                        "data_hash": row["data_hash"]
+                    }
+                }
+            else:
+                return {"exists": False, "timestamp": timestamp}
     except Exception as e:
         return {"error": str(e)}
 
@@ -634,7 +667,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
         skipped_duplicates = 0
         
         async with aiosqlite.connect(DB_PATH) as db:
-            for _, row in df.iterrows():
+            for idx, row in df.iterrows():
                 timestamp = str(row[ts_col]).strip()
                 if timestamp == 'nan' or not timestamp:
                     continue
@@ -649,7 +682,9 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
                         transmitter_id = transmitter_raw[:-2]
                     else:
                         transmitter_id = transmitter_raw
-                    logger.debug(f"Transmitter ID: {transmitter_id}")
+                    
+                    if idx < 5:  # Log first 5 for debugging
+                        logger.info(f"Row {idx}: timestamp={timestamp}, glucose={row.get(csv_glucose_col)}, transmitter={transmitter_id}")
                 
                 # Insert glucose readings with transmitter_id
                 if csv_glucose_col and pd.notna(row.get(csv_glucose_col)):
@@ -679,8 +714,13 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
                                 (timestamp, int(glucose_val), transmitter_id, reading_hash)
                             )
                             inserted_glucose += 1
+                            
+                            if inserted_glucose <= 5:  # Log first 5 insertions
+                                logger.info(f"INSERTED: {timestamp}, glucose={glucose_val}, transmitter={transmitter_id}")
                         else:
                             skipped_duplicates += 1
+                            if skipped_duplicates <= 5:  # Log first 5 skips
+                                logger.info(f"SKIPPED (duplicate): {timestamp}, glucose={glucose_val}, transmitter={transmitter_id}")
                 
                 # Insert insulin entries (using 'insulin' table)
                 if insulin_col and pd.notna(row.get(insulin_col)):
