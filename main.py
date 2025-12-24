@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.4.2 - Add debug endpoint
+Version: 2.4.3 - Fix glucose column detection (prioritize "value" over "rate")
 """
 
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.4.2")
+logger.info(f"Starting Stelo MCP v2.4.3")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists
@@ -378,7 +378,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Stelo Glucose MCP",
     description="Timothy's Dexcom Stelo glucose data integration for Simtheory.ai - Multi-sensor support",
-    version="2.4.2",
+    version="2.4.3",
     lifespan=lifespan
 )
 
@@ -401,7 +401,7 @@ async def handle_mcp_jsonrpc(body: dict) -> dict:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.4.2"}
+                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.4.3"}
             }
         }
     
@@ -475,7 +475,7 @@ async def root():
     """Root endpoint - service info."""
     return {
         "service": "stelo-glucose-mcp",
-        "version": "2.4.2",
+        "version": "2.4.3",
         "protocol": "MCP JSON-RPC",
         "description": "Timothy's Dexcom Stelo glucose data integration - Multi-sensor support (sensors change every 14-15 days)",
         "available_tools": [tool["name"] for tool in MCP_TOOLS],
@@ -538,7 +538,7 @@ async def health():
             
         return {
             "status": "healthy",
-            "version": "2.4.2",
+            "version": "2.4.3",
             "database": DB_PATH,
             "glucose_readings": count,
             "unique_sensors": sensor_count,
@@ -645,7 +645,8 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
             col_lower = col.lower()
             if 'timestamp' in col_lower and ts_col is None:
                 ts_col = col
-            if 'glucose' in col_lower and 'mg' in col_lower:
+            # FIXED: Prioritize "glucose value" over "glucose rate"
+            if 'glucose' in col_lower and 'value' in col_lower and 'mg' in col_lower:
                 csv_glucose_col = col
             if 'event subtype' in col_lower:
                 event_subtype_col = col
