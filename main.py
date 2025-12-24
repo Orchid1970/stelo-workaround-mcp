@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.2.8 - Use lifespan to properly initialize streamable HTTP transport
+Version: 2.3.0 - Add HTTP POST JSON-RPC handler for Simtheory compatibility
 """
 
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Database path - use /data for Railway volume persistence
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.2.8")
+logger.info(f"Starting Stelo MCP v2.3.0")
 logger.info(f"Database path: {DB_PATH}")
 
 # Ensure data directory exists
@@ -281,55 +281,231 @@ async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = ""
         return json.dumps({"error": str(e)})
 
 
-# ============== FastAPI App with proper MCP lifespan ==============
-
-# Get the SSE app - we'll manage its lifecycle ourselves
-sse_app = mcp.sse_app()
+# ============== FastAPI App ==============
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown."""
     logger.info("Application starting up...")
-    # Run the SSE app's lifespan if it has one
-    if hasattr(sse_app, 'router') and hasattr(sse_app.router, 'lifespan_context'):
-        async with sse_app.router.lifespan_context(sse_app):
-            yield
-    else:
-        yield
+    yield
     logger.info("Application shutting down...")
 
 
 # Create FastAPI app
-app = FastAPI(title="Stelo Glucose MCP", version="2.2.8", lifespan=lifespan)
+app = FastAPI(title="Stelo Glucose MCP", version="2.3.0", lifespan=lifespan)
 
 
-# Middleware to rewrite Host header for MCP routes
-@app.middleware("http")
-async def rewrite_host_for_mcp(request: Request, call_next):
-    """Rewrite the Host header for MCP routes to bypass validation."""
-    if request.url.path.startswith("/mcp"):
-        # Create a modified scope with localhost as the host
-        # This tricks the MCP SDK's host validation
-        scope = dict(request.scope)
-        headers = dict(request.headers)
-        # The MCP SDK checks the Host header, so we need to modify the scope
-        new_headers = []
-        for key, value in scope.get("headers", []):
-            if key == b"host":
-                new_headers.append((b"host", b"localhost:8085"))
+# ============== MCP JSON-RPC Handler (for Simtheory compatibility) ==============
+
+# Tool definitions for tools/list response
+MCP_TOOLS = [
+    {
+        "name": "get_latest_glucose",
+        "description": "Get the most recent glucose readings",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hours": {"type": "integer", "default": 24, "description": "Number of hours to look back"},
+                "limit": {"type": "integer", "default": 50, "description": "Maximum number of readings to return"}
+            }
+        }
+    },
+    {
+        "name": "get_glucose_stats",
+        "description": "Get glucose statistics for the specified number of days including average, min, max, std dev, time in range",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "default": 7, "description": "Number of days to analyze"}
+            }
+        }
+    },
+    {
+        "name": "get_summary",
+        "description": "Get a comprehensive summary of glucose data and logged entries",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "default": 14, "description": "Number of days to summarize"}
+            }
+        }
+    },
+    {
+        "name": "get_glucose_by_date",
+        "description": "Get all glucose readings for a specific date",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Date in YYYY-MM-DD format"}
+            },
+            "required": ["date"]
+        }
+    },
+    {
+        "name": "log_insulin",
+        "description": "Log an insulin dose",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "units": {"type": "number", "description": "Number of insulin units"},
+                "insulin_type": {"type": "string", "default": "rapid", "description": "Type of insulin (rapid, long, mixed)"},
+                "notes": {"type": "string", "default": "", "description": "Optional notes about the dose"}
+            },
+            "required": ["units"]
+        }
+    }
+]
+
+
+@app.post("/")
+async def mcp_jsonrpc_root(request: Request):
+    """Handle MCP JSON-RPC requests at root endpoint (Simtheory compatibility)."""
+    return await handle_mcp_jsonrpc(request)
+
+
+@app.post("/mcp")
+async def mcp_jsonrpc_mcp(request: Request):
+    """Handle MCP JSON-RPC requests at /mcp endpoint."""
+    return await handle_mcp_jsonrpc(request)
+
+
+async def handle_mcp_jsonrpc(request: Request):
+    """Process MCP JSON-RPC requests."""
+    try:
+        body = await request.json()
+        method = body.get("method", "")
+        request_id = body.get("id", 1)
+        params = body.get("params", {})
+        
+        logger.info(f"MCP JSON-RPC request: method={method}, id={request_id}")
+        
+        # Handle initialize
+        if method == "initialize":
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.3.0"}
+                }
+            })
+        
+        # Handle tools/list
+        elif method == "tools/list":
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"tools": MCP_TOOLS}
+            })
+        
+        # Handle tools/call
+        elif method == "tools/call":
+            tool_name = params.get("name", "")
+            arguments = params.get("arguments", {})
+            
+            logger.info(f"Calling tool: {tool_name} with args: {arguments}")
+            
+            # Route to appropriate tool
+            if tool_name == "get_latest_glucose":
+                result = await get_latest_glucose(
+                    hours=arguments.get("hours", 24),
+                    limit=arguments.get("limit", 50)
+                )
+            elif tool_name == "get_glucose_stats":
+                result = await get_glucose_stats(
+                    days=arguments.get("days", 7)
+                )
+            elif tool_name == "get_summary":
+                result = await get_summary(
+                    days=arguments.get("days", 14)
+                )
+            elif tool_name == "get_glucose_by_date":
+                date = arguments.get("date")
+                if not date:
+                    return JSONResponse({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32602, "message": "Missing required parameter: date"}
+                    })
+                result = await get_glucose_by_date(date=date)
+            elif tool_name == "log_insulin":
+                units = arguments.get("units")
+                if units is None:
+                    return JSONResponse({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32602, "message": "Missing required parameter: units"}
+                    })
+                result = await log_insulin(
+                    units=units,
+                    insulin_type=arguments.get("insulin_type", "rapid"),
+                    notes=arguments.get("notes", "")
+                )
             else:
-                new_headers.append((key, value))
-        scope["headers"] = new_headers
+                return JSONResponse({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
+                })
+            
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"content": [{"type": "text", "text": result}]}
+            })
         
-        # Create new request with modified scope
-        from starlette.requests import Request as StarletteRequest
-        modified_request = StarletteRequest(scope, request.receive)
+        # Handle notifications/initialized (no response needed but acknowledge)
+        elif method == "notifications/initialized":
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {}
+            })
         
-        # We can't easily pass the modified request through call_next
-        # So instead, let's handle MCP routes directly
-    
-    response = await call_next(request)
-    return response
+        # Unknown method
+        else:
+            logger.warning(f"Unknown MCP method: {method}")
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"}
+            })
+            
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}")
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"}
+        })
+    except Exception as e:
+        logger.error(f"MCP JSON-RPC error: {e}")
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32603, "message": str(e)}
+        })
+
+
+# ============== REST Endpoints ==============
+
+@app.get("/")
+async def root():
+    """Root endpoint - service info."""
+    return {
+        "service": "stelo-glucose-mcp",
+        "version": "2.3.0",
+        "protocol": "MCP JSON-RPC",
+        "description": "Timothy's Stelo glucose data integration for Simtheory.ai",
+        "available_tools": [t["name"] for t in MCP_TOOLS],
+        "endpoints": {
+            "mcp_protocol": "POST /",
+            "mcp_alt": "POST /mcp",
+            "health": "GET /health",
+            "upload": "POST /upload/clarity"
+        }
+    }
 
 
 @app.get("/health")
@@ -340,7 +516,7 @@ async def health():
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
             count = (await cursor.fetchone())[0]
-        return {"status": "healthy", "version": "2.2.8", "glucose_readings_count": count}
+        return {"status": "healthy", "version": "2.3.0", "glucose_readings_count": count}
     except Exception as e:
         logger.error(f"Health check error: {e}")
         return {"status": "error", "message": str(e)}
@@ -479,33 +655,3 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Error processing CSV: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
-
-
-# ============== Mount MCP with host header override ==============
-# Create a wrapper that modifies the host header before passing to SSE app
-from starlette.types import ASGIApp, Receive, Scope, Send
-
-class HostRewriteMiddleware:
-    """Middleware that rewrites the Host header to bypass MCP SDK validation."""
-    
-    def __init__(self, app: ASGIApp):
-        self.app = app
-    
-    async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] == "http":
-            # Rewrite host header to localhost
-            new_headers = []
-            for key, value in scope.get("headers", []):
-                if key == b"host":
-                    new_headers.append((b"host", b"localhost:8085"))
-                else:
-                    new_headers.append((key, value))
-            scope = dict(scope)
-            scope["headers"] = new_headers
-        
-        await self.app(scope, receive, send)
-
-
-# Wrap the SSE app with host rewrite middleware
-wrapped_sse_app = HostRewriteMiddleware(sse_app)
-app.mount("/mcp", wrapped_sse_app)
