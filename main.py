@@ -1,7 +1,7 @@
 """
 Stelo Glucose MCP Server - Workaround for Dexcom Stelo
 Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.3.1 - Add schema debug endpoint to diagnose column name mismatch
+Version: 2.3.1 - Auto-detect glucose column name for backward compatibility
 """
 
 import os
@@ -35,6 +35,9 @@ mcp = FastMCP("Stelo Glucose")
 # Flag to track if migrations have run
 _migrations_done = False
 
+# Cached glucose column name (detected at runtime)
+_glucose_column = None
+
 async def ensure_db_ready():
     """Ensure database is initialized. Called lazily on first request."""
     global _migrations_done
@@ -43,6 +46,31 @@ async def ensure_db_ready():
         run_migrations(DB_PATH)
         logger.info("Database initialized and migrations complete")
         _migrations_done = True
+
+async def get_glucose_column() -> str:
+    """Detect the glucose column name in the database."""
+    global _glucose_column
+    if _glucose_column is not None:
+        return _glucose_column
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("PRAGMA table_info(glucose_readings)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        logger.info(f"Detected columns in glucose_readings: {columns}")
+        
+        # Check for known column names in order of preference
+        if 'glucose_mg_dl' in columns:
+            _glucose_column = 'glucose_mg_dl'
+        elif 'value' in columns:
+            _glucose_column = 'value'
+        elif 'glucose_value' in columns:
+            _glucose_column = 'glucose_value'
+        else:
+            # Default, might fail but let's try
+            _glucose_column = 'glucose_mg_dl'
+        
+        logger.info(f"Using glucose column: {_glucose_column}")
+        return _glucose_column
 
 
 # ============== MCP Tool Definitions (for JSON-RPC tools/list) ==============
@@ -98,8 +126,8 @@ MCP_TOOLS = [
             "properties": {
                 "units": {"type": "number", "description": "Number of insulin units"},
                 "insulin_type": {"type": "string", "default": "rapid", "description": "Type of insulin (rapid, long, etc.)"},
-                "notes": {"type": "string", "default": "", "description": "Optional notes"}
-            },
+                "notes": {"type": "string", "default": "", "description": "Optional notes"}}
+            ,
             "required": ["units"]
         }
     }
@@ -112,10 +140,12 @@ async def get_latest_glucose(hours: int = 24, limit: int = 50) -> str:
     """Get the most recent glucose readings."""
     try:
         await ensure_db_ready()
+        glucose_col = await get_glucose_column()
+        
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """SELECT timestamp, glucose_mg_dl 
+                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl 
                    FROM glucose_readings 
                    ORDER BY timestamp DESC 
                    LIMIT ?""",
@@ -133,12 +163,13 @@ async def get_glucose_stats(days: int = 7) -> str:
     """Get glucose statistics for the specified number of days."""
     try:
         await ensure_db_ready()
+        glucose_col = await get_glucose_column()
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """SELECT glucose_mg_dl FROM glucose_readings 
+                f"""SELECT {glucose_col} as glucose_mg_dl FROM glucose_readings 
                    WHERE timestamp >= ?""",
                 (cutoff,)
             )
@@ -183,6 +214,7 @@ async def get_summary(days: int = 14) -> str:
     """Get a comprehensive summary of glucose data and logged entries."""
     try:
         await ensure_db_ready()
+        glucose_col = await get_glucose_column()
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         
         async with aiosqlite.connect(DB_PATH) as db:
@@ -190,7 +222,7 @@ async def get_summary(days: int = 14) -> str:
             
             # Get glucose readings
             cursor = await db.execute(
-                """SELECT timestamp, glucose_mg_dl FROM glucose_readings 
+                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl FROM glucose_readings 
                    WHERE timestamp >= ? ORDER BY timestamp""",
                 (cutoff,)
             )
@@ -249,11 +281,12 @@ async def get_glucose_by_date(date: str) -> str:
     """Get glucose readings for a specific date."""
     try:
         await ensure_db_ready()
+        glucose_col = await get_glucose_column()
         
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """SELECT timestamp, glucose_mg_dl FROM glucose_readings 
+                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl FROM glucose_readings 
                    WHERE timestamp LIKE ? ORDER BY timestamp""",
                 (f"{date}%",)
             )
@@ -425,7 +458,7 @@ async def root():
             "mcp_alt": "POST /mcp",
             "health": "GET /health",
             "upload": "POST /upload/clarity",
-            "debug_schema": "GET /debug/schema"
+            "schema": "GET /debug/schema"
         }
     }
 
@@ -467,6 +500,7 @@ async def health():
     """Health check endpoint."""
     try:
         await ensure_db_ready()
+        glucose_col = await get_glucose_column()
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
             count = (await cursor.fetchone())[0]
@@ -474,7 +508,8 @@ async def health():
             "status": "healthy",
             "version": "2.3.1",
             "database": DB_PATH,
-            "glucose_readings": count
+            "glucose_readings": count,
+            "glucose_column": glucose_col
         }
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
@@ -482,7 +517,7 @@ async def health():
 
 @app.get("/debug/schema")
 async def debug_schema():
-    """Debug endpoint to check actual database schema."""
+    """Debug endpoint to show database schema."""
     try:
         await ensure_db_ready()
         async with aiosqlite.connect(DB_PATH) as db:
@@ -490,33 +525,18 @@ async def debug_schema():
             cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = [row[0] for row in await cursor.fetchall()]
             
-            schema_info = {"tables": {}}
-            
+            schema = {}
             for table in tables:
                 cursor = await db.execute(f"PRAGMA table_info({table})")
-                columns = await cursor.fetchall()
-                schema_info["tables"][table] = {
-                    "columns": [
-                        {"name": col[1], "type": col[2], "notnull": col[3], "pk": col[5]}
-                        for col in columns
-                    ]
-                }
-                
-                # Get row count
-                cursor = await db.execute(f"SELECT COUNT(*) FROM {table}")
-                count = (await cursor.fetchone())[0]
-                schema_info["tables"][table]["row_count"] = count
-                
-                # Get sample row if exists
-                if count > 0:
-                    cursor = await db.execute(f"SELECT * FROM {table} LIMIT 1")
-                    sample = await cursor.fetchone()
-                    col_names = [col[1] for col in columns]
-                    schema_info["tables"][table]["sample_row"] = dict(zip(col_names, sample))
+                columns = [{"name": row[1], "type": row[2]} for row in await cursor.fetchall()]
+                schema[table] = columns
             
-            return schema_info
+            return {
+                "database": DB_PATH,
+                "tables": tables,
+                "schema": schema
+            }
     except Exception as e:
-        logger.error(f"Error getting schema: {e}")
         return {"error": str(e)}
 
 
@@ -525,6 +545,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
     """Upload and process a Dexcom Clarity CSV export."""
     try:
         await ensure_db_ready()
+        glucose_col = await get_glucose_column()
         content = await file.read()
         file_hash = hashlib.sha256(content).hexdigest()[:16]
         
@@ -546,7 +567,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
         df.columns = df.columns.str.strip()
         
         ts_col = None
-        glucose_col = None
+        csv_glucose_col = None
         insulin_col = None
         carbs_col = None
         event_subtype_col = None
@@ -556,7 +577,7 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
             if 'timestamp' in col_lower and ts_col is None:
                 ts_col = col
             if 'glucose' in col_lower and 'mg' in col_lower:
-                glucose_col = col
+                csv_glucose_col = col
             if 'event subtype' in col_lower:
                 event_subtype_col = col
             if 'insulin' in col_lower and 'value' in col_lower:
@@ -578,18 +599,18 @@ async def upload_clarity_csv(file: UploadFile = File(...)):
                 if timestamp == 'nan' or not timestamp:
                     continue
                 
-                if glucose_col and pd.notna(row.get(glucose_col)):
-                    glucose_val = row[glucose_col]
+                if csv_glucose_col and pd.notna(row.get(csv_glucose_col)):
+                    glucose_val = row[csv_glucose_col]
                     if isinstance(glucose_val, (int, float)) and glucose_val > 0:
                         reading_hash = hashlib.sha256(f"{timestamp}:{glucose_val}:{file_hash}".encode()).hexdigest()[:16]
                         cursor = await db.execute(
-                            "SELECT 1 FROM glucose_readings WHERE timestamp = ? AND glucose_mg_dl = ?",
+                            f"SELECT 1 FROM glucose_readings WHERE timestamp = ? AND {glucose_col} = ?",
                             (timestamp, int(glucose_val))
                         )
                         exists = await cursor.fetchone()
                         if not exists:
                             await db.execute(
-                                """INSERT INTO glucose_readings (timestamp, glucose_mg_dl, data_hash)
+                                f"""INSERT INTO glucose_readings (timestamp, {glucose_col}, data_hash)
                                    VALUES (?, ?, ?)""",
                                 (timestamp, int(glucose_val), reading_hash)
                             )
