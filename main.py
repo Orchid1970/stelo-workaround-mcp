@@ -1,792 +1,519 @@
 """
-Stelo Glucose MCP Server - Workaround for Dexcom Stelo
-Uploads Dexcom Clarity CSV exports and provides glucose data via MCP tools.
-Version: 2.4.3 - Fix glucose column detection (prioritize "value" over "rate")
+Stelo Workaround MCP - FastAPI service for Dexcom Stelo/Clarity CSV imports
+with MCP endpoints for Simtheory.ai
 """
-
 import os
-import json
-import hashlib
+import io
+import csv
+import sqlite3
 import logging
+import hashlib
 from datetime import datetime, timedelta
-from contextlib import asynccontextmanager
-import aiosqlite
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from typing import Optional
+from contextlib import contextmanager
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
-from mcp.server.fastmcp import FastMCP
-import pandas as pd
+from pydantic import BaseModel
+
+# Import migrations
+from migrations import run_migrations, check_and_add_data_hash_column
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database path - use /data for Railway volume persistence
+# Database setup
 DB_PATH = os.environ.get("DB_PATH", "/data/stelo.db")
 
-logger.info(f"Starting Stelo MCP v2.4.3")
-logger.info(f"Database path: {DB_PATH}")
+app = FastAPI(
+    title="Stelo Workaround MCP",
+    description="Import Dexcom Stelo/Clarity CSV exports into SQLite with MCP endpoints",
+    version="1.0.0"
+)
 
 # Ensure data directory exists
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# Initialize FastMCP (keeping for potential future SSE support)
-mcp = FastMCP("Stelo Glucose")
-
-# Flag to track if migrations have run
-_migrations_done = False
-
-# Cached glucose column name (detected at runtime)
-_glucose_column = None
-
-async def ensure_db_ready():
-    """Ensure database is initialized. Called lazily on first request."""
-    global _migrations_done
-    if not _migrations_done:
-        from migrations import run_migrations
-        run_migrations(DB_PATH)
-        logger.info("Database initialized and migrations complete")
-        _migrations_done = True
-
-async def get_glucose_column() -> str:
-    """Detect the glucose column name in the database."""
-    global _glucose_column
-    if _glucose_column is not None:
-        return _glucose_column
+def init_db():
+    """Initialize the database with required tables"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("PRAGMA table_info(glucose_readings)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        logger.info(f"Detected columns in glucose_readings: {columns}")
-        
-        # Check for known column names in order of preference
-        if 'glucose_value' in columns:
-            _glucose_column = 'glucose_value'
-        elif 'glucose_mg_dl' in columns:
-            _glucose_column = 'glucose_mg_dl'
-        elif 'value' in columns:
-            _glucose_column = 'value'
-        else:
-            # Default, might fail but let's try
-            _glucose_column = 'glucose_value'
-        
-        logger.info(f"Using glucose column: {_glucose_column}")
-        return _glucose_column
+    # Create glucose_readings table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS glucose_readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            glucose_value INTEGER NOT NULL,
+            rate_of_change REAL,
+            transmitter_id TEXT,
+            data_hash TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Create indexes for faster queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON glucose_readings(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_transmitter ON glucose_readings(transmitter_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp_transmitter ON glucose_readings(timestamp, transmitter_id)")
+    
+    conn.commit()
+    conn.close()
+    
+    # Run migrations to add any new columns
+    run_migrations(DB_PATH)
+    
+    logger.info(f"Database initialized at {DB_PATH}")
 
-
-# ============== MCP Tool Definitions (for JSON-RPC tools/list) ==============
-
-MCP_TOOLS = [
-    {
-        "name": "get_latest_glucose",
-        "description": "Get the most recent glucose readings from Dexcom Stelo",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "hours": {"type": "integer", "default": 24, "description": "Number of hours to look back (default 24)"},
-                "limit": {"type": "integer", "default": 50, "description": "Maximum number of readings to return (default 50)"}
-            }
-        }
-    },
-    {
-        "name": "get_glucose_stats",
-        "description": "Get glucose statistics for the specified number of days, including average, min, max, standard deviation, and time in range",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "days": {"type": "integer", "default": 7, "description": "Number of days to analyze (default 7)"}
-            }
-        }
-    },
-    {
-        "name": "get_summary",
-        "description": "Get a comprehensive summary of glucose data including stats, patterns, and logged insulin/carb entries",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "days": {"type": "integer", "default": 14, "description": "Number of days to summarize (default 14)"}
-            }
-        }
-    },
-    {
-        "name": "get_glucose_by_date",
-        "description": "Get glucose readings for a specific date",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "Date in YYYY-MM-DD format"}
-            },
-            "required": ["date"]
-        }
-    },
-    {
-        "name": "log_insulin",
-        "description": "Log an insulin dose",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "units": {"type": "number", "description": "Number of insulin units"},
-                "insulin_type": {"type": "string", "default": "rapid", "description": "Type of insulin (rapid, long, etc.)"},
-                "notes": {"type": "string", "default": "", "description": "Optional notes"}
-            },
-            "required": ["units"]
-        }
-    }
-]
-
-
-# ============== MCP Tool Implementations ==============
-
-async def get_latest_glucose(hours: int = 24, limit: int = 50) -> str:
-    """Get the most recent glucose readings from all sensors."""
+@contextmanager
+def get_db():
+    """Context manager for database connections"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     try:
-        await ensure_db_ready()
-        glucose_col = await get_glucose_column()
+        yield conn
+    finally:
+        conn.close()
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "database": DB_PATH}
+
+# CSV Upload endpoint for Clarity exports
+@app.post("/upload/clarity")
+async def upload_clarity(file: UploadFile = File(...)):
+    """
+    Upload a Dexcom Clarity CSV export file.
+    Parses the CSV and imports glucose readings into the database.
+    """
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="File must be a CSV")
+    
+    try:
+        contents = await file.read()
+        decoded = contents.decode('utf-8-sig')  # Handle BOM
         
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl, transmitter_id 
-                   FROM glucose_readings 
-                   ORDER BY timestamp DESC 
-                   LIMIT ?""",
-                (limit,)
+        reader = csv.DictReader(io.StringIO(decoded))
+        
+        # Detect column names (Clarity exports have specific column names)
+        fieldnames = reader.fieldnames
+        
+        # Map possible column names
+        timestamp_col = None
+        glucose_col = None
+        rate_col = None
+        transmitter_col = None
+        event_type_col = None
+        
+        for col in fieldnames:
+            col_lower = col.lower()
+            if 'timestamp' in col_lower:
+                timestamp_col = col
+            elif 'glucose' in col_lower and 'value' in col_lower:
+                glucose_col = col
+            elif 'rate' in col_lower:
+                rate_col = col
+            elif 'transmitter' in col_lower and 'id' in col_lower:
+                transmitter_col = col
+            elif col_lower == 'event type' or col_lower == 'event_type':
+                event_type_col = col
+        
+        if not timestamp_col or not glucose_col:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Could not find required columns. Found: {fieldnames}"
             )
-            rows = await cursor.fetchall()
-            readings = [
-                {
-                    "timestamp": row["timestamp"], 
-                    "glucose_mg_dl": row["glucose_mg_dl"],
-                    "transmitter_id": row["transmitter_id"] if row["transmitter_id"] else "unknown"
-                } 
-                for row in rows
-            ]
-            return json.dumps({"readings": readings, "count": len(readings)}, indent=2)
+        
+        logger.info(f"CSV columns detected: timestamp={timestamp_col}, glucose={glucose_col}, transmitter={transmitter_col}")
+        
+        inserted = 0
+        duplicates = 0
+        transmitter_ids = set()
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            for row in reader:
+                # Skip non-EGV rows (header rows, calibration, etc.)
+                if event_type_col and row.get(event_type_col) != 'EGV':
+                    continue
+                
+                timestamp = row.get(timestamp_col, '').strip()
+                glucose_str = row.get(glucose_col, '').strip()
+                
+                # Skip rows without valid data
+                if not timestamp or not glucose_str:
+                    continue
+                
+                # Parse glucose value
+                try:
+                    glucose_value = int(glucose_str)
+                except ValueError:
+                    continue
+                
+                # Get optional fields
+                rate_of_change = None
+                if rate_col and row.get(rate_col):
+                    try:
+                        rate_of_change = float(row.get(rate_col))
+                    except ValueError:
+                        pass
+                
+                transmitter_id = None
+                if transmitter_col and row.get(transmitter_col):
+                    transmitter_id = str(row.get(transmitter_col)).strip()
+                    # Clean up transmitter ID (remove .0 if present from float conversion)
+                    if transmitter_id.endswith('.0'):
+                        transmitter_id = transmitter_id[:-2]
+                    transmitter_ids.add(transmitter_id)
+                
+                # Check for duplicate based on timestamp and transmitter_id only
+                # This fixes the issue where data_hash was marking all overlapping 
+                # historical data as duplicates
+                cursor.execute("""
+                    SELECT COUNT(*) FROM glucose_readings 
+                    WHERE timestamp = ? AND transmitter_id = ?
+                """, (timestamp, transmitter_id))
+                
+                if cursor.fetchone()[0] > 0:
+                    duplicates += 1
+                    continue
+                
+                # Insert new reading
+                cursor.execute("""
+                    INSERT INTO glucose_readings 
+                    (timestamp, glucose_value, rate_of_change, transmitter_id)
+                    VALUES (?, ?, ?, ?)
+                """, (timestamp, glucose_value, rate_of_change, transmitter_id))
+                
+                inserted += 1
+            
+            conn.commit()
+        
+        logger.info(f"Upload complete: {inserted} new readings, {duplicates} duplicates, {len(transmitter_ids)} unique sensors")
+        
+        return {
+            "status": "success",
+            "inserted": inserted,
+            "duplicates": duplicates,
+            "transmitter_ids": list(transmitter_ids)
+        }
+        
     except Exception as e:
-        logger.error(f"Error fetching glucose: {e}")
-        return json.dumps({"error": str(e)})
+        logger.error(f"Error processing CSV: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+# MCP Endpoint for JSON-RPC
+class MCPRequest(BaseModel):
+    jsonrpc: str = "2.0"
+    method: str
+    params: Optional[dict] = None
+    id: Optional[str] = None
 
-async def get_glucose_stats(days: int = 7) -> str:
-    """Get glucose statistics for the specified number of days (across all sensors)."""
-    try:
-        await ensure_db_ready()
-        glucose_col = await get_glucose_column()
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                f"""SELECT {glucose_col} as glucose_mg_dl, transmitter_id FROM glucose_readings 
-                   WHERE timestamp >= ?""",
-                (cutoff,)
-            )
-            rows = await cursor.fetchall()
-            
-            if not rows:
-                return json.dumps({"error": "No readings found for this period"})
-            
-            values = [row["glucose_mg_dl"] for row in rows]
-            avg = sum(values) / len(values)
-            min_val = min(values)
-            max_val = max(values)
-            in_range = sum(1 for v in values if 70 <= v <= 180)
-            below_range = sum(1 for v in values if v < 70)
-            above_range = sum(1 for v in values if v > 180)
-            variance = sum((v - avg) ** 2 for v in values) / len(values)
-            std_dev = variance ** 0.5
-            cv = (std_dev / avg) * 100 if avg > 0 else 0
-            
-            # Get unique sensors in this period
-            sensors = list(set(row["transmitter_id"] for row in rows if row["transmitter_id"]))
-            
-            stats = {
-                "period_days": days,
-                "total_readings": len(values),
-                "sensors_used": len(sensors),
-                "sensor_ids": sensors,
-                "average_mg_dl": round(avg, 1),
-                "min_mg_dl": min_val,
-                "max_mg_dl": max_val,
-                "std_dev": round(std_dev, 1),
-                "cv_percent": round(cv, 1),
-                "time_in_range_percent": round(in_range / len(values) * 100, 1),
-                "time_below_range_percent": round(below_range / len(values) * 100, 1),
-                "time_above_range_percent": round(above_range / len(values) * 100, 1),
-                "readings_in_range": in_range,
-                "readings_below_70": below_range,
-                "readings_above_180": above_range
-            }
-            return json.dumps(stats, indent=2)
-    except Exception as e:
-        logger.error(f"Error calculating stats: {e}")
-        return json.dumps({"error": str(e)})
-
-
-async def get_summary(days: int = 14) -> str:
-    """Get a comprehensive summary of glucose data and logged entries (across all sensors)."""
-    try:
-        await ensure_db_ready()
-        glucose_col = await get_glucose_column()
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            
-            # Get glucose readings
-            cursor = await db.execute(
-                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl, transmitter_id FROM glucose_readings 
-                   WHERE timestamp >= ? ORDER BY timestamp""",
-                (cutoff,)
-            )
-            glucose_rows = await cursor.fetchall()
-            
-            # Get insulin entries (table is 'insulin', not 'insulin_entries')
-            cursor = await db.execute(
-                """SELECT timestamp, units, insulin_type FROM insulin 
-                   WHERE timestamp >= ? ORDER BY timestamp""",
-                (cutoff,)
-            )
-            insulin_rows = await cursor.fetchall()
-            
-            # Get carb entries (table is 'carbs', column is 'carbs_grams')
-            cursor = await db.execute(
-                """SELECT timestamp, carbs_grams FROM carbs 
-                   WHERE timestamp >= ? ORDER BY timestamp""",
-                (cutoff,)
-            )
-            carb_rows = await cursor.fetchall()
-            
-            if not glucose_rows:
-                return json.dumps({"error": "No glucose readings found for this period"})
-            
-            values = [row["glucose_mg_dl"] for row in glucose_rows]
-            avg = sum(values) / len(values)
-            in_range = sum(1 for v in values if 70 <= v <= 180)
-            
-            # Get unique sensors
-            sensors = list(set(row["transmitter_id"] for row in glucose_rows if row["transmitter_id"]))
-            
-            summary = {
-                "period_days": days,
-                "glucose": {
-                    "total_readings": len(values),
-                    "sensors_used": len(sensors),
-                    "sensor_ids": sensors,
-                    "average_mg_dl": round(avg, 1),
-                    "min_mg_dl": min(values),
-                    "max_mg_dl": max(values),
-                    "time_in_range_percent": round(in_range / len(values) * 100, 1)
-                },
-                "insulin_entries": len(insulin_rows),
-                "carb_entries": len(carb_rows),
-                "recent_insulin": [
-                    {"timestamp": row["timestamp"], "units": row["units"], "type": row["insulin_type"]}
-                    for row in insulin_rows[-5:]
-                ],
-                "recent_carbs": [
-                    {"timestamp": row["timestamp"], "grams": row["carbs_grams"]}
-                    for row in carb_rows[-5:]
+@app.post("/mcp")
+async def mcp_endpoint(request: MCPRequest):
+    """MCP JSON-RPC endpoint for Simtheory.ai integration"""
+    logger.info(f"MCP JSON-RPC: method={request.method}, id={request.id}")
+    
+    if request.method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "get_latest_glucose",
+                        "description": "Get the most recent glucose readings",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "hours": {
+                                    "type": "integer",
+                                    "description": "Number of hours to look back (default: 24)",
+                                    "default": 24
+                                },
+                                "limit": {
+                                    "type": "integer",
+                                    "description": "Maximum number of readings to return (default: 100)",
+                                    "default": 100
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "get_glucose_stats",
+                        "description": "Get glucose statistics for a time period",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "days": {
+                                    "type": "integer",
+                                    "description": "Number of days to analyze (default: 7)",
+                                    "default": 7
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "get_summary",
+                        "description": "Get a natural language summary of glucose data",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "days": {
+                                    "type": "integer",
+                                    "description": "Number of days to summarize (default: 7)",
+                                    "default": 7
+                                }
+                            }
+                        }
+                    }
                 ]
             }
-            return json.dumps(summary, indent=2)
-    except Exception as e:
-        logger.error(f"Error getting summary: {e}")
-        return json.dumps({"error": str(e)})
-
-
-async def get_glucose_by_date(date: str) -> str:
-    """Get glucose readings for a specific date (across all sensors)."""
-    try:
-        await ensure_db_ready()
-        glucose_col = await get_glucose_column()
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl, transmitter_id FROM glucose_readings 
-                   WHERE timestamp LIKE ? ORDER BY timestamp""",
-                (f"{date}%",)
-            )
-            rows = await cursor.fetchall()
-            
-            if not rows:
-                return json.dumps({"error": f"No readings found for {date}"})
-            
-            readings = [
-                {
-                    "timestamp": row["timestamp"], 
-                    "glucose_mg_dl": row["glucose_mg_dl"],
-                    "transmitter_id": row["transmitter_id"] if row["transmitter_id"] else "unknown"
-                } 
-                for row in rows
-            ]
-            values = [row["glucose_mg_dl"] for row in rows]
-            
-            return json.dumps({
-                "date": date,
-                "readings": readings,
-                "count": len(readings),
-                "average_mg_dl": round(sum(values) / len(values), 1),
-                "min_mg_dl": min(values),
-                "max_mg_dl": max(values)
-            }, indent=2)
-    except Exception as e:
-        logger.error(f"Error fetching glucose by date: {e}")
-        return json.dumps({"error": str(e)})
-
-
-async def log_insulin(units: float, insulin_type: str = "rapid", notes: str = "") -> str:
-    """Log an insulin dose."""
-    try:
-        await ensure_db_ready()
-        timestamp = datetime.now().isoformat()
-        data_hash = hashlib.sha256(f"{timestamp}:{units}:{insulin_type}".encode()).hexdigest()[:16]
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Use 'insulin' table with correct columns
-            await db.execute(
-                """INSERT INTO insulin (timestamp, units, insulin_type, data_hash)
-                   VALUES (?, ?, ?, ?)""",
-                (timestamp, units, insulin_type, data_hash)
-            )
-            await db.commit()
-        
-        return json.dumps({
-            "status": "success",
-            "logged": {
-                "timestamp": timestamp,
-                "units": units,
-                "insulin_type": insulin_type,
-                "notes": notes
-            }
-        }, indent=2)
-    except Exception as e:
-        logger.error(f"Error logging insulin: {e}")
-        return json.dumps({"error": str(e)})
-
-
-# ============== FastAPI App Setup ==============
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    logger.info("Application starting up...")
-    yield
-    logger.info("Application shutting down...")
-
-
-app = FastAPI(
-    title="Stelo Glucose MCP",
-    description="Timothy's Dexcom Stelo glucose data integration for Simtheory.ai - Multi-sensor support",
-    version="2.4.3",
-    lifespan=lifespan
-)
-
-
-# ============== MCP JSON-RPC Handler ==============
-
-async def handle_mcp_jsonrpc(body: dict) -> dict:
-    """Handle MCP JSON-RPC requests."""
-    method = body.get("method", "")
-    request_id = body.get("id", 1)
-    params = body.get("params", {})
-    
-    logger.info(f"MCP JSON-RPC: method={method}, id={request_id}")
-    
-    # Handle initialize
-    if method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "stelo-glucose-mcp", "version": "2.4.3"}
-            }
         }
     
-    # Handle notifications/initialized (acknowledgment, no response needed but we'll confirm)
-    elif method == "notifications/initialized":
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {}
-        }
-    
-    # Handle tools/list
-    elif method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {"tools": MCP_TOOLS}
-        }
-    
-    # Handle tools/call
-    elif method == "tools/call":
-        tool_name = params.get("name", "")
-        arguments = params.get("arguments", {})
+    elif request.method == "tools/call":
+        tool_name = request.params.get("name") if request.params else None
+        tool_args = request.params.get("arguments", {}) if request.params else {}
         
-        logger.info(f"Tool call: {tool_name} with args: {arguments}")
+        logger.info(f"Tool call: {tool_name} with args: {tool_args}")
         
-        try:
-            if tool_name == "get_latest_glucose":
-                result = await get_latest_glucose(**arguments)
-            elif tool_name == "get_glucose_stats":
-                result = await get_glucose_stats(**arguments)
-            elif tool_name == "get_summary":
-                result = await get_summary(**arguments)
-            elif tool_name == "get_glucose_by_date":
-                result = await get_glucose_by_date(**arguments)
-            elif tool_name == "log_insulin":
-                result = await log_insulin(**arguments)
-            else:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
+        if tool_name == "get_latest_glucose":
+            hours = tool_args.get("hours", 24)
+            limit = tool_args.get("limit", 100)
+            
+            cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+            
+            with get_db() as conn:
+                cursor = conn.execute("""
+                    SELECT timestamp, glucose_value, rate_of_change, transmitter_id
+                    FROM glucose_readings
+                    WHERE timestamp >= ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (cutoff, limit))
+                
+                readings = [
+                    {
+                        "timestamp": row["timestamp"],
+                        "glucose": row["glucose_value"],
+                        "rate_of_change": row["rate_of_change"],
+                        "transmitter_id": row["transmitter_id"]
+                    }
+                    for row in cursor.fetchall()
+                ]
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Found {len(readings)} readings in the last {hours} hours:\n" + 
+                                   "\n".join([f"  {r['timestamp']}: {r['glucose']} mg/dL" for r in readings[:10]]) +
+                                   (f"\n  ... and {len(readings) - 10} more" if len(readings) > 10 else "")
+                        }
+                    ],
+                    "data": readings
                 }
+            }
+        
+        elif tool_name == "get_glucose_stats":
+            days = tool_args.get("days", 7)
+            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            
+            with get_db() as conn:
+                cursor = conn.execute("""
+                    SELECT 
+                        COUNT(*) as count,
+                        AVG(glucose_value) as avg,
+                        MIN(glucose_value) as min,
+                        MAX(glucose_value) as max,
+                        MIN(timestamp) as first_reading,
+                        MAX(timestamp) as last_reading
+                    FROM glucose_readings
+                    WHERE timestamp >= ?
+                """, (cutoff,))
+                
+                row = cursor.fetchone()
+                
+                # Calculate time in range (70-180 mg/dL)
+                cursor2 = conn.execute("""
+                    SELECT 
+                        COUNT(*) as in_range
+                    FROM glucose_readings
+                    WHERE timestamp >= ? AND glucose_value BETWEEN 70 AND 180
+                """, (cutoff,))
+                in_range = cursor2.fetchone()["in_range"]
+                
+                # Calculate time below range (<70)
+                cursor3 = conn.execute("""
+                    SELECT COUNT(*) as below
+                    FROM glucose_readings
+                    WHERE timestamp >= ? AND glucose_value < 70
+                """, (cutoff,))
+                below_range = cursor3.fetchone()["below"]
+                
+                # Calculate time above range (>180)
+                cursor4 = conn.execute("""
+                    SELECT COUNT(*) as above
+                    FROM glucose_readings
+                    WHERE timestamp >= ? AND glucose_value > 180
+                """, (cutoff,))
+                above_range = cursor4.fetchone()["above"]
+            
+            total = row["count"] if row["count"] else 1
+            stats = {
+                "period_days": days,
+                "total_readings": row["count"],
+                "average_glucose": round(row["avg"], 1) if row["avg"] else None,
+                "min_glucose": row["min"],
+                "max_glucose": row["max"],
+                "first_reading": row["first_reading"],
+                "last_reading": row["last_reading"],
+                "time_in_range_pct": round(in_range / total * 100, 1),
+                "time_below_range_pct": round(below_range / total * 100, 1),
+                "time_above_range_pct": round(above_range / total * 100, 1)
+            }
             
             return {
                 "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {"content": [{"type": "text", "text": result}]}
+                "id": request.id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Glucose Statistics ({days} days):\n" +
+                                   f"  Average: {stats['average_glucose']} mg/dL\n" +
+                                   f"  Range: {stats['min_glucose']} - {stats['max_glucose']} mg/dL\n" +
+                                   f"  Time in Range (70-180): {stats['time_in_range_pct']}%\n" +
+                                   f"  Time Below (<70): {stats['time_below_range_pct']}%\n" +
+                                   f"  Time Above (>180): {stats['time_above_range_pct']}%\n" +
+                                   f"  Total Readings: {stats['total_readings']}"
+                        }
+                    ],
+                    "data": stats
+                }
             }
-        except Exception as e:
-            logger.error(f"Tool execution error: {e}")
+        
+        elif tool_name == "get_summary":
+            days = tool_args.get("days", 7)
+            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            
+            with get_db() as conn:
+                cursor = conn.execute("""
+                    SELECT 
+                        COUNT(*) as count,
+                        AVG(glucose_value) as avg,
+                        MIN(glucose_value) as min,
+                        MAX(glucose_value) as max
+                    FROM glucose_readings
+                    WHERE timestamp >= ?
+                """, (cutoff,))
+                row = cursor.fetchone()
+                
+                # Time in range
+                cursor2 = conn.execute("""
+                    SELECT COUNT(*) as in_range
+                    FROM glucose_readings
+                    WHERE timestamp >= ? AND glucose_value BETWEEN 70 AND 180
+                """, (cutoff,))
+                in_range = cursor2.fetchone()["in_range"]
+            
+            total = row["count"] if row["count"] else 1
+            tir_pct = round(in_range / total * 100, 1)
+            avg = round(row["avg"], 1) if row["avg"] else 0
+            
+            # Generate summary
+            if tir_pct >= 70:
+                control_status = "excellent glucose control"
+            elif tir_pct >= 50:
+                control_status = "moderate glucose control"
+            else:
+                control_status = "glucose levels that need attention"
+            
+            summary = f"""Over the past {days} days, you've had {control_status} with {tir_pct}% time in range (70-180 mg/dL).
+
+Your average glucose was {avg} mg/dL, ranging from {row['min']} to {row['max']} mg/dL across {row['count']} readings.
+
+{"Great job maintaining stable levels!" if tir_pct >= 70 else "Consider reviewing meal timing and activity patterns to improve time in range."}"""
+            
             return {
                 "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {"code": -32603, "message": str(e)}
+                "id": request.id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": summary
+                        }
+                    ]
+                }
+            }
+        
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "error": {
+                    "code": -32601,
+                    "message": f"Unknown tool: {tool_name}"
+                }
             }
     
-    # Unknown method
     else:
         return {
             "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"}
+            "id": request.id,
+            "error": {
+                "code": -32601,
+                "message": f"Method not found: {request.method}"
+            }
         }
 
+# Manual database query endpoint (for debugging)
+@app.get("/debug/readings")
+async def debug_readings(limit: int = 10):
+    """Debug endpoint to view recent readings"""
+    with get_db() as conn:
+        cursor = conn.execute("""
+            SELECT * FROM glucose_readings
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit,))
+        
+        readings = [dict(row) for row in cursor.fetchall()]
+    
+    return {"readings": readings}
 
-# ============== HTTP Endpoints ==============
-
-@app.get("/")
-async def root():
-    """Root endpoint - service info."""
+@app.get("/debug/count")
+async def debug_count():
+    """Debug endpoint to get total reading count"""
+    with get_db() as conn:
+        cursor = conn.execute("SELECT COUNT(*) as count FROM glucose_readings")
+        count = cursor.fetchone()["count"]
+        
+        cursor2 = conn.execute("""
+            SELECT MIN(timestamp) as first, MAX(timestamp) as last 
+            FROM glucose_readings
+        """)
+        row = cursor2.fetchone()
+    
     return {
-        "service": "stelo-glucose-mcp",
-        "version": "2.4.3",
-        "protocol": "MCP JSON-RPC",
-        "description": "Timothy's Dexcom Stelo glucose data integration - Multi-sensor support (sensors change every 14-15 days)",
-        "available_tools": [tool["name"] for tool in MCP_TOOLS],
-        "endpoints": {
-            "mcp_protocol": "POST /",
-            "mcp_alt": "POST /mcp",
-            "health": "GET /health",
-            "upload": "POST /upload/clarity",
-            "schema": "GET /debug/schema",
-            "debug_reading": "GET /debug/reading?timestamp=YYYY-MM-DDThh:mm:ss"
-        }
+        "total_readings": count,
+        "first_reading": row["first"],
+        "last_reading": row["last"]
     }
 
-
-@app.post("/")
-async def mcp_root(request: Request):
-    """Handle MCP JSON-RPC requests at root (Simtheory.ai compatible)."""
-    try:
-        body = await request.json()
-        response = await handle_mcp_jsonrpc(body)
-        return JSONResponse(response)
-    except Exception as e:
-        logger.error(f"MCP JSON-RPC error at /: {e}")
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "error": {"code": -32603, "message": str(e)}
-        })
-
-
-@app.post("/mcp")
-async def mcp_endpoint(request: Request):
-    """Handle MCP JSON-RPC requests at /mcp (alternative endpoint)."""
-    try:
-        body = await request.json()
-        response = await handle_mcp_jsonrpc(body)
-        return JSONResponse(response)
-    except Exception as e:
-        logger.error(f"MCP JSON-RPC error at /mcp: {e}")
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "error": {"code": -32603, "message": str(e)}
-        })
-
-
-@app.get("/health")
-async def health():
-    """Health check endpoint."""
-    try:
-        await ensure_db_ready()
-        glucose_col = await get_glucose_column()
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
-            count = (await cursor.fetchone())[0]
-            
-            # Count unique sensors
-            cursor = await db.execute("SELECT COUNT(DISTINCT transmitter_id) FROM glucose_readings WHERE transmitter_id IS NOT NULL")
-            sensor_count = (await cursor.fetchone())[0]
-            
-        return {
-            "status": "healthy",
-            "version": "2.4.3",
-            "database": DB_PATH,
-            "glucose_readings": count,
-            "unique_sensors": sensor_count,
-            "glucose_column": glucose_col
-        }
-    except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}
-
-
-@app.get("/debug/schema")
-async def debug_schema():
-    """Debug endpoint to show database schema."""
-    try:
-        await ensure_db_ready()
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get all tables
-            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [row[0] for row in await cursor.fetchall()]
-            
-            schema = {}
-            for table in tables:
-                cursor = await db.execute(f"PRAGMA table_info({table})")
-                columns = [{"name": row[1], "type": row[2]} for row in await cursor.fetchall()]
-                schema[table] = columns
-            
-            return {
-                "database": DB_PATH,
-                "tables": tables,
-                "schema": schema
-            }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/debug/reading")
-async def debug_reading(timestamp: str):
-    """Debug endpoint to check if a specific reading exists."""
-    try:
-        await ensure_db_ready()
-        glucose_col = await get_glucose_column()
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                f"""SELECT timestamp, {glucose_col} as glucose_mg_dl, transmitter_id, data_hash 
-                   FROM glucose_readings 
-                   WHERE timestamp = ?""",
-                (timestamp,)
-            )
-            row = await cursor.fetchone()
-            
-            if row:
-                return {
-                    "exists": True,
-                    "reading": {
-                        "timestamp": row["timestamp"],
-                        "glucose_mg_dl": row["glucose_mg_dl"],
-                        "transmitter_id": row["transmitter_id"],
-                        "data_hash": row["data_hash"]
-                    }
-                }
-            else:
-                return {"exists": False, "timestamp": timestamp}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/upload/clarity")
-async def upload_clarity_csv(file: UploadFile = File(...)):
-    """
-    Upload and process a Dexcom Clarity CSV export.
-    Supports multiple sensors - Stelo sensors are replaced every 14-15 days.
-    """
-    try:
-        await ensure_db_ready()
-        glucose_col = await get_glucose_column()
-        content = await file.read()
-        file_hash = hashlib.sha256(content).hexdigest()[:16]
-        
-        try:
-            text = content.decode('utf-8')
-        except UnicodeDecodeError:
-            text = content.decode('latin-1')
-        
-        lines = text.strip().split('\n')
-        header_idx = 0
-        for i, line in enumerate(lines):
-            if 'Timestamp' in line or 'timestamp' in line:
-                header_idx = i
-                break
-        
-        from io import StringIO
-        csv_data = '\n'.join(lines[header_idx:])
-        df = pd.read_csv(StringIO(csv_data))
-        df.columns = df.columns.str.strip()
-        
-        ts_col = None
-        csv_glucose_col = None
-        insulin_col = None
-        carbs_col = None
-        event_subtype_col = None
-        transmitter_col = None
-        
-        for col in df.columns:
-            col_lower = col.lower()
-            if 'timestamp' in col_lower and ts_col is None:
-                ts_col = col
-            # FIXED: Prioritize "glucose value" over "glucose rate"
-            if 'glucose' in col_lower and 'value' in col_lower and 'mg' in col_lower:
-                csv_glucose_col = col
-            if 'event subtype' in col_lower:
-                event_subtype_col = col
-            if 'insulin' in col_lower and 'value' in col_lower:
-                insulin_col = col
-            if 'carb' in col_lower and 'value' in col_lower:
-                carbs_col = col
-            if 'transmitter' in col_lower and 'id' in col_lower:
-                transmitter_col = col
-        
-        if not ts_col:
-            raise HTTPException(status_code=400, detail="Could not find timestamp column")
-        
-        logger.info(f"CSV columns detected: timestamp={ts_col}, glucose={csv_glucose_col}, transmitter={transmitter_col}")
-        
-        inserted_glucose = 0
-        inserted_insulin = 0
-        inserted_carbs = 0
-        skipped_duplicates = 0
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            for idx, row in df.iterrows():
-                timestamp = str(row[ts_col]).strip()
-                if timestamp == 'nan' or not timestamp:
-                    continue
-                
-                # Get transmitter ID from CSV (important for multi-sensor support)
-                # Pandas may convert to float, so strip .0 if present
-                transmitter_id = None
-                if transmitter_col and pd.notna(row.get(transmitter_col)):
-                    transmitter_raw = str(row[transmitter_col]).strip()
-                    # Remove .0 if pandas converted integer to float
-                    if transmitter_raw.endswith('.0'):
-                        transmitter_id = transmitter_raw[:-2]
-                    else:
-                        transmitter_id = transmitter_raw
-                    
-                    if idx < 5:  # Log first 5 for debugging
-                        logger.info(f"Row {idx}: timestamp={timestamp}, glucose={row.get(csv_glucose_col)}, transmitter={transmitter_id}")
-                
-                # Insert glucose readings with transmitter_id
-                if csv_glucose_col and pd.notna(row.get(csv_glucose_col)):
-                    glucose_val = row[csv_glucose_col]
-                    if isinstance(glucose_val, (int, float)) and glucose_val > 0:
-                        reading_hash = hashlib.sha256(f"{timestamp}:{glucose_val}:{transmitter_id}:{file_hash}".encode()).hexdigest()[:16]
-                        
-                        # Check for duplicates using timestamp + glucose + transmitter_id
-                        # This allows same timestamp/value from different sensors
-                        if transmitter_id:
-                            cursor = await db.execute(
-                                f"SELECT 1 FROM glucose_readings WHERE timestamp = ? AND {glucose_col} = ? AND transmitter_id = ?",
-                                (timestamp, int(glucose_val), transmitter_id)
-                            )
-                        else:
-                            # Fallback for old data without transmitter_id
-                            cursor = await db.execute(
-                                f"SELECT 1 FROM glucose_readings WHERE timestamp = ? AND {glucose_col} = ? AND transmitter_id IS NULL",
-                                (timestamp, int(glucose_val))
-                            )
-                        
-                        exists = await cursor.fetchone()
-                        if not exists:
-                            await db.execute(
-                                f"""INSERT INTO glucose_readings (timestamp, {glucose_col}, transmitter_id, data_hash)
-                                   VALUES (?, ?, ?, ?)""",
-                                (timestamp, int(glucose_val), transmitter_id, reading_hash)
-                            )
-                            inserted_glucose += 1
-                            
-                            if inserted_glucose <= 5:  # Log first 5 insertions
-                                logger.info(f"INSERTED: {timestamp}, glucose={glucose_val}, transmitter={transmitter_id}")
-                        else:
-                            skipped_duplicates += 1
-                            if skipped_duplicates <= 5:  # Log first 5 skips
-                                logger.info(f"SKIPPED (duplicate): {timestamp}, glucose={glucose_val}, transmitter={transmitter_id}")
-                
-                # Insert insulin entries (using 'insulin' table)
-                if insulin_col and pd.notna(row.get(insulin_col)):
-                    insulin_val = row[insulin_col]
-                    if isinstance(insulin_val, (int, float)) and insulin_val > 0:
-                        cursor = await db.execute(
-                            "SELECT 1 FROM insulin WHERE timestamp = ? AND units = ?",
-                            (timestamp, float(insulin_val))
-                        )
-                        exists = await cursor.fetchone()
-                        if not exists:
-                            insulin_type = "rapid"
-                            if event_subtype_col and pd.notna(row.get(event_subtype_col)):
-                                subtype = str(row[event_subtype_col]).lower()
-                                if 'long' in subtype:
-                                    insulin_type = "long"
-                            ins_hash = hashlib.sha256(f"{timestamp}:{insulin_val}:{file_hash}".encode()).hexdigest()[:16]
-                            await db.execute(
-                                """INSERT INTO insulin (timestamp, units, insulin_type, data_hash)
-                                   VALUES (?, ?, ?, ?)""",
-                                (timestamp, float(insulin_val), insulin_type, ins_hash)
-                            )
-                            inserted_insulin += 1
-                
-                # Insert carb entries (using 'carbs' table with 'carbs_grams' column)
-                if carbs_col and pd.notna(row.get(carbs_col)):
-                    carbs_val = row[carbs_col]
-                    if isinstance(carbs_val, (int, float)) and carbs_val > 0:
-                        cursor = await db.execute(
-                            "SELECT 1 FROM carbs WHERE timestamp = ? AND carbs_grams = ?",
-                            (timestamp, int(carbs_val))
-                        )
-                        exists = await cursor.fetchone()
-                        if not exists:
-                            carb_hash = hashlib.sha256(f"{timestamp}:{carbs_val}:{file_hash}".encode()).hexdigest()[:16]
-                            await db.execute(
-                                """INSERT INTO carbs (timestamp, carbs_grams, data_hash)
-                                   VALUES (?, ?, ?)""",
-                                (timestamp, int(carbs_val), carb_hash)
-                            )
-                            inserted_carbs += 1
-            
-            await db.commit()
-            cursor = await db.execute("SELECT COUNT(*) FROM glucose_readings")
-            total = (await cursor.fetchone())[0]
-            
-            # Count unique sensors
-            cursor = await db.execute("SELECT COUNT(DISTINCT transmitter_id) FROM glucose_readings WHERE transmitter_id IS NOT NULL")
-            sensor_count = (await cursor.fetchone())[0]
-        
-        logger.info(f"Upload complete: {inserted_glucose} new readings, {skipped_duplicates} duplicates, {sensor_count} unique sensors")
-        
-        return {
-            "status": "success",
-            "file": file.filename,
-            "inserted_glucose_readings": inserted_glucose,
-            "inserted_insulin_entries": inserted_insulin,
-            "inserted_carb_entries": inserted_carbs,
-            "skipped_duplicates": skipped_duplicates,
-            "total_glucose_readings": total,
-            "unique_sensors": sensor_count
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error processing CSV: {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
